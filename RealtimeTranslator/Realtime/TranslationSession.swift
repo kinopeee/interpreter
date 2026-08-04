@@ -81,6 +81,7 @@ final class InterpretationSession {
         let sourceText: String
         let language: SpokenLanguage
         let sourceGeneration: Int
+        var attemptCount: Int
     }
 
     weak var delegate: InterpretationSessionDelegate?
@@ -89,6 +90,8 @@ final class InterpretationSession {
     private let translationService: any LocalTranslationServicing
     private let aggregator: SubtitleAggregator
     private let maxPendingFinalTranslations: Int
+    private let maxFinalTranslationAttempts: Int
+    private let finalTranslationRetryDelayNanoseconds: UInt64
     private let activeTickerIntervalNanoseconds: UInt64
     private let idleTickerIntervalNanoseconds: UInt64
 
@@ -119,14 +122,19 @@ final class InterpretationSession {
         speechService: any LocalSpeechRecognitionServicing = LocalSpeechRecognitionService(),
         aggregator: SubtitleAggregator = SubtitleAggregator(),
         maxPendingFinalTranslations: Int = 32,
+        maxFinalTranslationAttempts: Int = 5,
+        finalTranslationRetryDelayNanoseconds: UInt64 = 250_000_000,
         activeTickerIntervalNanoseconds: UInt64 = 200_000_000,
         idleTickerIntervalNanoseconds: UInt64 = 200_000_000
     ) {
         precondition(maxPendingFinalTranslations > 0)
+        precondition(maxFinalTranslationAttempts > 0)
         self.translationService = translationService
         self.speechService = speechService
         self.aggregator = aggregator
         self.maxPendingFinalTranslations = maxPendingFinalTranslations
+        self.maxFinalTranslationAttempts = maxFinalTranslationAttempts
+        self.finalTranslationRetryDelayNanoseconds = finalTranslationRetryDelayNanoseconds
         self.activeTickerIntervalNanoseconds = activeTickerIntervalNanoseconds
         self.idleTickerIntervalNanoseconds = idleTickerIntervalNanoseconds
         speechService.delegate = self
@@ -351,7 +359,8 @@ final class InterpretationSession {
             FinalTranslationRequest(
                 sourceText: sourceText,
                 language: language,
-                sourceGeneration: sourceGeneration
+                sourceGeneration: sourceGeneration,
+                attemptCount: 0
             )
         )
         guard finalTranslationWorker == nil else { return }
@@ -391,6 +400,8 @@ final class InterpretationSession {
                     finalTranslationQueue.removeAll()
                     return
                 }
+                // Request-level cancellation (for example translation session restart)
+                // should not abandon later finals already queued behind this one.
                 continue
             } catch {
                 aggregator.setStatusBanner("ローカル翻訳を準備中…")
@@ -398,6 +409,28 @@ final class InterpretationSession {
                 AppLogger.general.error(
                     "Final local translation failed: \(error.localizedDescription, privacy: .public)"
                 )
+
+                let nextAttemptCount = request.attemptCount + 1
+                guard nextAttemptCount < maxFinalTranslationAttempts else {
+                    AppLogger.general.error(
+                        "Final local translation exhausted retries; dropping finalized sentence"
+                    )
+                    continue
+                }
+
+                var retryRequest = request
+                retryRequest.attemptCount = nextAttemptCount
+                finalTranslationQueue.insert(retryRequest, at: 0)
+
+                if finalTranslationRetryDelayNanoseconds > 0 {
+                    try? await Task.sleep(
+                        nanoseconds: finalTranslationRetryDelayNanoseconds
+                    )
+                }
+                if Task.isCancelled {
+                    finalTranslationQueue.removeAll()
+                    return
+                }
             }
         }
     }
