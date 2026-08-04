@@ -1,0 +1,11 @@
+.DS_Store
+*.xcodeproj
+*.xcworkspace
+DerivedData/
+build/
+*.xcuserstate
+xcuserdata/
+*.swp
+.idea/
+*.log
+.env
