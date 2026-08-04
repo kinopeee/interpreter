@@ -59,6 +59,9 @@ final class SubtitleWindowController: NSObject {
         controlHostingView.frame = controlContainerView.bounds
         controlHostingView.autoresizingMask = [.width, .height]
         translationHostingView.frame = NSRect(x: 0, y: 0, width: 1, height: 1)
+        // 0ではなく0.01: 完全に不可視にするとSwiftUIがビューを非アクティブ扱いし、
+        // `translationTask`が動かず翻訳セッションを受け取れなくなる。
+        // このビューは破棄・再生成してはならない(AGENTS.mdの不変条件)。
         translationHostingView.alphaValue = 0.01
         controlContainerView.addSubview(controlHostingView)
         controlContainerView.addSubview(translationHostingView)

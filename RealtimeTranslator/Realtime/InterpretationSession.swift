@@ -18,6 +18,13 @@ protocol InterpretationSessionDelegate: AnyObject {
 
 @MainActor
 final class InterpretationSession {
+    /// 発話途中の原文表示の最小間隔。AGENTS.mdの字幕UI不変条件
+    /// 「発話途中の原文表示は約160ms間隔に抑え、行高を維持してちらつきを防ぐ」に対応する。
+    private static let transcriptionRenderInterval: TimeInterval = 0.16
+    /// 発話途中のlive翻訳を依頼するまでのデバウンス。原文が細かく更新される間は
+    /// 翻訳を待ち、無駄な翻訳依頼と訳文のちらつきを抑える。
+    private static let liveTranslationDebounceNanoseconds: UInt64 = 300_000_000
+
     private struct PendingTranscription {
         let text: String
         let language: SpokenLanguage
@@ -25,6 +32,8 @@ final class InterpretationSession {
     }
 
     private struct CurrentUtterance {
+        /// 原文更新のたびに増える世代番号。翻訳結果の適用時に照合し、
+        /// 発話更新前の古い訳文が画面へ反映されるのを防ぐ(AGENTS.mdの不変条件)。
         private(set) var generation = 0
         private(set) var sourceText = ""
         private(set) var translatedText = ""
@@ -81,6 +90,7 @@ final class InterpretationSession {
         let sourceText: String
         let language: SpokenLanguage
         let sourceGeneration: Int
+        var attemptCount: Int
     }
 
     weak var delegate: InterpretationSessionDelegate?
@@ -89,6 +99,8 @@ final class InterpretationSession {
     private let translationService: any LocalTranslationServicing
     private let aggregator: SubtitleAggregator
     private let maxPendingFinalTranslations: Int
+    private let maxFinalTranslationAttempts: Int
+    private let finalTranslationRetryDelayNanoseconds: UInt64
     private let activeTickerIntervalNanoseconds: UInt64
     private let idleTickerIntervalNanoseconds: UInt64
 
@@ -111,6 +123,8 @@ final class InterpretationSession {
     private var transcriptionRenderTask: Task<Void, Never>?
     private var pendingTranscription: PendingTranscription?
     private var lastTranscriptionRenderedAt = Date.distantPast
+    /// start/stopの世代番号。起動待ちの間に停止が割り込んだ場合、
+    /// 古い起動処理が状態を上書きするのを防ぐ。
     private var lifecycleGeneration = 0
     private var currentUtterance = CurrentUtterance()
 
@@ -119,14 +133,19 @@ final class InterpretationSession {
         speechService: any LocalSpeechRecognitionServicing = LocalSpeechRecognitionService(),
         aggregator: SubtitleAggregator = SubtitleAggregator(),
         maxPendingFinalTranslations: Int = 32,
+        maxFinalTranslationAttempts: Int = 5,
+        finalTranslationRetryDelayNanoseconds: UInt64 = 250_000_000,
         activeTickerIntervalNanoseconds: UInt64 = 200_000_000,
         idleTickerIntervalNanoseconds: UInt64 = 200_000_000
     ) {
         precondition(maxPendingFinalTranslations > 0)
+        precondition(maxFinalTranslationAttempts > 0)
         self.translationService = translationService
         self.speechService = speechService
         self.aggregator = aggregator
         self.maxPendingFinalTranslations = maxPendingFinalTranslations
+        self.maxFinalTranslationAttempts = maxFinalTranslationAttempts
+        self.finalTranslationRetryDelayNanoseconds = finalTranslationRetryDelayNanoseconds
         self.activeTickerIntervalNanoseconds = activeTickerIntervalNanoseconds
         self.idleTickerIntervalNanoseconds = idleTickerIntervalNanoseconds
         speechService.delegate = self
@@ -138,12 +157,8 @@ final class InterpretationSession {
         let generation = lifecycleGeneration
         state = .connecting
         aggregator.reset()
-        transcriptionRenderTask?.cancel()
-        transcriptionRenderTask = nil
-        pendingTranscription = nil
+        cancelTransientWork()
         currentUtterance.reset()
-        liveTranslationTask?.cancel()
-        liveTranslationTask = nil
         finalTranslationQueue.removeAll()
         aggregator.setStatusBanner("ローカル音声認識を準備中…")
         publishSubtitles()
@@ -191,11 +206,7 @@ final class InterpretationSession {
         aggregator.setStatusBanner("録音を終了中…")
         publishSubtitles()
 
-        transcriptionRenderTask?.cancel()
-        transcriptionRenderTask = nil
-        pendingTranscription = nil
-        liveTranslationTask?.cancel()
-        liveTranslationTask = nil
+        cancelTransientWork()
 
         await speechService.stop()
         if let finalTranslationWorker {
@@ -212,6 +223,16 @@ final class InterpretationSession {
         } else {
             startTicker(intervalNanoseconds: idleTickerIntervalNanoseconds)
         }
+    }
+
+    /// 発話途中の一時的な処理(表示スロットリング待ちの原文とlive翻訳)を打ち切る。
+    /// 開始時と停止時の両方から呼び、開始/停止で対称にリセットする。
+    private func cancelTransientWork() {
+        transcriptionRenderTask?.cancel()
+        transcriptionRenderTask = nil
+        pendingTranscription = nil
+        liveTranslationTask?.cancel()
+        liveTranslationTask = nil
     }
 
     private func handleTranscription(
@@ -243,7 +264,7 @@ final class InterpretationSession {
         guard transcriptionRenderTask == nil else { return }
 
         let elapsed = Date().timeIntervalSince(lastTranscriptionRenderedAt)
-        let delay = max(0, 0.16 - elapsed)
+        let delay = max(0, Self.transcriptionRenderInterval - elapsed)
         transcriptionRenderTask = Task { @MainActor [weak self] in
             if delay > 0 {
                 try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
@@ -301,7 +322,7 @@ final class InterpretationSession {
 
         liveTranslationTask = Task { @MainActor [weak self] in
             guard let self else { return }
-            try? await Task.sleep(nanoseconds: 300_000_000)
+            try? await Task.sleep(nanoseconds: Self.liveTranslationDebounceNanoseconds)
             guard !Task.isCancelled else { return }
 
             do {
@@ -351,7 +372,8 @@ final class InterpretationSession {
             FinalTranslationRequest(
                 sourceText: sourceText,
                 language: language,
-                sourceGeneration: sourceGeneration
+                sourceGeneration: sourceGeneration,
+                attemptCount: 0
             )
         )
         guard finalTranslationWorker == nil else { return }
@@ -391,6 +413,8 @@ final class InterpretationSession {
                     finalTranslationQueue.removeAll()
                     return
                 }
+                // Request-level cancellation (for example translation session restart)
+                // should not abandon later finals already queued behind this one.
                 continue
             } catch {
                 aggregator.setStatusBanner("ローカル翻訳を準備中…")
@@ -398,6 +422,28 @@ final class InterpretationSession {
                 AppLogger.general.error(
                     "Final local translation failed: \(error.localizedDescription, privacy: .public)"
                 )
+
+                let nextAttemptCount = request.attemptCount + 1
+                guard nextAttemptCount < maxFinalTranslationAttempts else {
+                    AppLogger.general.error(
+                        "Final local translation exhausted retries; dropping finalized sentence"
+                    )
+                    continue
+                }
+
+                var retryRequest = request
+                retryRequest.attemptCount = nextAttemptCount
+                finalTranslationQueue.insert(retryRequest, at: 0)
+
+                if finalTranslationRetryDelayNanoseconds > 0 {
+                    try? await Task.sleep(
+                        nanoseconds: finalTranslationRetryDelayNanoseconds
+                    )
+                }
+                if Task.isCancelled {
+                    finalTranslationQueue.removeAll()
+                    return
+                }
             }
         }
     }

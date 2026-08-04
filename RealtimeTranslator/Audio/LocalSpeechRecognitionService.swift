@@ -165,16 +165,29 @@ final class LocalSpeechRecognitionService: LocalSpeechRecognitionServicing {
         case stopping(Int)
     }
 
+    /// マイクtapが1回に受け取るフレーム数。小さいほど低遅延だがコールバック頻度が上がる。
+    private static let tapBufferSize: AVAudioFrameCount = 4096
+    /// 音声バッファプールの容量。tapスレッドとfeederタスク間の一時的な滞留を吸収する。
+    private static let bufferPoolCapacity = 64
+    /// 認識結果に信頼度属性が付かない場合のフォールバック値(中立)。
+    private static let fallbackConfidence = 0.5
+    /// 両レーンの候補が出揃わないままレーン選択へフォールバックするまでの待ち時間。
+    private static let languageSelectionDelayNanoseconds: UInt64 = 180_000_000
+
     weak var delegate: LocalSpeechRecognitionServiceDelegate?
 
     private let audioEngine = AVAudioEngine()
     private var runningPipeline: RunningSpeechPipeline?
     private var speechArbiter = BilingualSpeechArbiter()
     private var languageSelectionTask: Task<Void, Never>?
+    /// レーン選択フォールバックタスクの重複起動を防ぐ世代番号。
+    /// キャンセル時にインクリメントし、古いタスクが`languageSelectionTask`をnil化するのを防ぐ。
     private var languageSelectionTaskGeneration = 0
     private var lastEmittedSignature: String?
     private var lifecycleState: LifecycleState = .idle
+    /// start/stopの世代番号。起動中に停止が割り込んだ場合、古い起動処理を途中で打ち切る。
     private var lifecycleGeneration = 0
+    /// 認識結果を受理する世代。停止後に届いた前世代の遅延結果を破棄する。
     private var acceptedResultGeneration: Int?
 
     private func requestPermission() async -> Bool {
@@ -353,16 +366,14 @@ final class LocalSpeechRecognitionService: LocalSpeechRecognitionServicing {
             throw LocalSpeechRecognitionError.audioConverterUnavailable
         }
 
-        let tapBufferSize: AVAudioFrameCount = 4096
         let captureFrameCapacity = max(
-            tapBufferSize,
+            Self.tapBufferSize,
             AVAudioFrameCount(inputFormat.sampleRate.rounded(.up))
         )
-        let bufferPoolCapacity = 64
         guard let bufferPool = CapturedAudioBufferPool(
             format: inputFormat,
             frameCapacity: captureFrameCapacity,
-            capacity: bufferPoolCapacity
+            capacity: Self.bufferPoolCapacity
         ) else {
             throw LocalSpeechRecognitionError.audioBufferPoolUnavailable
         }
@@ -371,8 +382,8 @@ final class LocalSpeechRecognitionService: LocalSpeechRecognitionServicing {
             inputFormat: inputFormat,
             converter: converter,
             bufferPool: bufferPool,
-            tapBufferSize: tapBufferSize,
-            bufferPoolCapacity: bufferPoolCapacity
+            tapBufferSize: Self.tapBufferSize,
+            bufferPoolCapacity: Self.bufferPoolCapacity
         )
     }
 
@@ -389,6 +400,9 @@ final class LocalSpeechRecognitionService: LocalSpeechRecognitionServicing {
         try await analyzer.prepareToAnalyze(in: analyzerFormat)
         try ensureStartupIsCurrent(generation)
 
+        // ストリーム滞留数をプール容量より2件少なくし、tapが取得直後の1件と
+        // feederが変換中の1件がプール外にあってもtapスレッドが空きバッファを
+        // 取得できる(=音声を取りこぼさない)ようにする。
         let (captureStream, captureContinuation) =
             AsyncStream<CapturedAudioBuffer>.makeStream(
                 bufferingPolicy: .bufferingNewest(
@@ -583,7 +597,7 @@ final class LocalSpeechRecognitionService: LocalSpeechRecognitionServicing {
 
         let confidenceValues = result.text.runs.compactMap(\.transcriptionConfidence)
         let confidence = confidenceValues.isEmpty
-            ? 0.5
+            ? Self.fallbackConfidence
             : confidenceValues.reduce(0, +) / Double(confidenceValues.count)
         let candidate = SpeechRecognitionCandidate(
             text: text,
@@ -619,7 +633,7 @@ final class LocalSpeechRecognitionService: LocalSpeechRecognitionServicing {
                 }
             }
 
-            try? await Task.sleep(nanoseconds: 180_000_000)
+            try? await Task.sleep(nanoseconds: Self.languageSelectionDelayNanoseconds)
             while !Task.isCancelled {
                 guard !Task.isCancelled,
                       self.acceptedResultGeneration == generation,
@@ -640,6 +654,8 @@ final class LocalSpeechRecognitionService: LocalSpeechRecognitionServicing {
         languageSelectionTask = nil
     }
 
+    /// 直接受理(`submit`)と遅延選択(`selectBestAvailable`)の両経路から
+    /// 同一候補が届いた場合の重複通知を、内容シグネチャの比較で防ぐ。
     private func emit(_ candidate: SpeechRecognitionCandidate) {
         let signature = [
             String(describing: candidate.language),

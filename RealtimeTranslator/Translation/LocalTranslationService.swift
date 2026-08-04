@@ -17,301 +17,7 @@ enum LocalTranslationError: Error, LocalizedError, Sendable, Equatable {
     }
 }
 
-enum LocalTranslationPriority: Sendable {
-    case live
-    case final
-}
-
-struct TranslationSchedulerEnqueueResult<Item> {
-    let supersededLive: Item?
-    let rejectedFinal: Item?
-}
-
-struct LatestTranslationScheduler<Item> {
-    private let finalCapacity: Int
-    private var finalItems: [Item] = []
-    private var liveItem: Item?
-
-    init(finalCapacity: Int = 32) {
-        precondition(finalCapacity > 0)
-        self.finalCapacity = finalCapacity
-    }
-
-    var isEmpty: Bool {
-        finalItems.isEmpty && liveItem == nil
-    }
-
-    var pendingFinalCount: Int {
-        finalItems.count
-    }
-
-    mutating func enqueue(
-        _ item: Item,
-        priority: LocalTranslationPriority
-    ) -> TranslationSchedulerEnqueueResult<Item> {
-        switch priority {
-        case .live:
-            let superseded = liveItem
-            liveItem = item
-            return TranslationSchedulerEnqueueResult(
-                supersededLive: superseded,
-                rejectedFinal: nil
-            )
-        case .final:
-            guard finalItems.count < finalCapacity else {
-                return TranslationSchedulerEnqueueResult(
-                    supersededLive: nil,
-                    rejectedFinal: item
-                )
-            }
-            let superseded = liveItem
-            liveItem = nil
-            finalItems.append(item)
-            return TranslationSchedulerEnqueueResult(
-                supersededLive: superseded,
-                rejectedFinal: nil
-            )
-        }
-    }
-
-    mutating func next() -> Item? {
-        if !finalItems.isEmpty {
-            return finalItems.removeFirst()
-        }
-        defer { liveItem = nil }
-        return liveItem
-    }
-
-    mutating func removeAll(where shouldRemove: (Item) -> Bool) -> [Item] {
-        var removed: [Item] = []
-        if let liveItem, shouldRemove(liveItem) {
-            removed.append(liveItem)
-            self.liveItem = nil
-        }
-
-        var retainedFinalItems: [Item] = []
-        retainedFinalItems.reserveCapacity(finalItems.count)
-        for item in finalItems {
-            if shouldRemove(item) {
-                removed.append(item)
-            } else {
-                retainedFinalItems.append(item)
-            }
-        }
-        finalItems = retainedFinalItems
-        return removed
-    }
-
-    mutating func removeAll() -> [Item] {
-        var removed = finalItems
-        if let liveItem {
-            removed.append(liveItem)
-        }
-        finalItems.removeAll(keepingCapacity: true)
-        liveItem = nil
-        return removed
-    }
-}
-
-final class PendingTranslationRequest: @unchecked Sendable {
-    private enum State {
-        case awaitingContinuation
-        case pending(CheckedContinuation<String, Error>)
-        case resolved(Result<String, Error>)
-    }
-
-    let text: String
-    let priority: LocalTranslationPriority
-    private let state = OSAllocatedUnfairLock(initialState: State.awaitingContinuation)
-
-    init(text: String, priority: LocalTranslationPriority) {
-        self.text = text
-        self.priority = priority
-    }
-
-    var isActive: Bool {
-        state.withLock { state in
-            switch state {
-            case .awaitingContinuation, .pending:
-                return true
-            case .resolved:
-                return false
-            }
-        }
-    }
-
-    func install(_ continuation: CheckedContinuation<String, Error>) -> Bool {
-        let resolvedResult = state.withLock {
-            state -> Result<String, Error>? in
-            switch state {
-            case .awaitingContinuation:
-                state = .pending(continuation)
-                return nil
-            case .pending:
-                preconditionFailure("Translation continuation installed twice")
-            case .resolved(let result):
-                return result
-            }
-        }
-        if let resolvedResult {
-            continuation.resume(with: resolvedResult)
-            return false
-        }
-        return true
-    }
-
-    func cancel() {
-        resolve(with: .failure(CancellationError()))
-    }
-
-    func complete(with result: Result<String, Error>) {
-        resolve(with: result)
-    }
-
-    private func resolve(with result: Result<String, Error>) {
-        let continuation = state.withLock { state -> CheckedContinuation<String, Error>? in
-            switch state {
-            case .awaitingContinuation:
-                state = .resolved(result)
-                return nil
-            case .pending(let continuation):
-                state = .resolved(result)
-                return continuation
-            case .resolved:
-                return nil
-            }
-        }
-        continuation?.resume(with: result)
-    }
-}
-
-@MainActor
-final class CoalescingTranslationWakeSignal {
-    enum SendResult: Equatable {
-        case enqueued
-        case coalesced
-        case terminated
-    }
-
-    let stream: AsyncStream<Void>
-    private let signalContinuation: AsyncStream<Void>.Continuation
-
-    init() {
-        (stream, signalContinuation) = AsyncStream.makeStream(
-            bufferingPolicy: .bufferingNewest(1)
-        )
-    }
-
-    @discardableResult
-    func send() -> SendResult {
-        switch signalContinuation.yield(()) {
-        case .enqueued:
-            return .enqueued
-        case .dropped:
-            return .coalesced
-        case .terminated:
-            return .terminated
-        @unknown default:
-            return .terminated
-        }
-    }
-
-    func finish() {
-        signalContinuation.finish()
-    }
-}
-
-@MainActor
-final class TranslationLane {
-    private struct ActiveWork {
-        let request: PendingTranslationRequest
-        let cancel: () -> Void
-    }
-
-    private var scheduler: LatestTranslationScheduler<PendingTranslationRequest>
-    private var wakeSignal: CoalescingTranslationWakeSignal?
-    private var activeWork: ActiveWork?
-
-    init(finalCapacity: Int) {
-        scheduler = LatestTranslationScheduler(finalCapacity: finalCapacity)
-    }
-
-    func beginRun() -> AsyncStream<Void> {
-        precondition(wakeSignal == nil, "Translation lane already has a consumer")
-        let wakeSignal = CoalescingTranslationWakeSignal()
-        self.wakeSignal = wakeSignal
-        if !scheduler.isEmpty {
-            wakeSignal.send()
-        }
-        return wakeSignal.stream
-    }
-
-    func endRun() {
-        wakeSignal?.finish()
-        wakeSignal = nil
-        cancelAll()
-    }
-
-    func submit(_ request: PendingTranslationRequest) {
-        guard request.isActive else { return }
-        _ = scheduler.removeAll { !$0.isActive }
-        let result = scheduler.enqueue(request, priority: request.priority)
-        if let rejectedFinal = result.rejectedFinal {
-            rejectedFinal.complete(with: .failure(LocalTranslationError.queueFull))
-            return
-        }
-        result.supersededLive?.cancel()
-        if request.priority == .final {
-            preemptActiveLive()
-        }
-        wakeSignal?.send()
-    }
-
-    func takeNext() -> PendingTranslationRequest? {
-        while let request = scheduler.next() {
-            if request.isActive {
-                return request
-            }
-        }
-        return nil
-    }
-
-    func beginActiveWork(
-        request: PendingTranslationRequest,
-        cancel: @escaping () -> Void
-    ) {
-        precondition(activeWork == nil)
-        activeWork = ActiveWork(request: request, cancel: cancel)
-    }
-
-    func finishActiveWork(request: PendingTranslationRequest) {
-        guard activeWork?.request === request else { return }
-        activeWork = nil
-    }
-
-    func cancel(_ request: PendingTranslationRequest) {
-        _ = scheduler.removeAll { $0 === request }
-        guard activeWork?.request === request else { return }
-        activeWork?.cancel()
-    }
-
-    private func preemptActiveLive() {
-        guard let activeWork, activeWork.request.priority == .live else { return }
-        activeWork.request.cancel()
-        activeWork.cancel()
-    }
-
-    private func cancelAll() {
-        let pendingRequests = scheduler.removeAll()
-        for request in pendingRequests {
-            request.cancel()
-        }
-        activeWork?.request.cancel()
-        activeWork?.cancel()
-        activeWork = nil
-    }
-}
-
+/// Apple Translationの実セッションを抽象化する境界。テストではフェイクに差し替える。
 @MainActor
 protocol LocalTranslationSessionDriving: AnyObject {
     func prepare() async throws
@@ -344,6 +50,8 @@ protocol LocalTranslationServicing: AnyObject {
     ) async throws -> String
 }
 
+/// 日→英と英→日の2レーンを持つローカル翻訳サービス。
+/// 各レーンのワーカーは`LocalTranslationHostView`の`translationTask`から起動される。
 @MainActor
 final class LocalTranslationService: LocalTranslationServicing {
     private let jaToEnLane: TranslationLane
@@ -437,34 +145,51 @@ final class LocalTranslationService: LocalTranslationServicing {
         }
         guard !Task.isCancelled else { return }
 
-        signalLoop: for await _ in signals {
-            while let request = lane.takeNext() {
-                if !isPrepared {
-                    let preparation = await prepare(
-                        for: request,
-                        driver: driver,
-                        lane: lane,
-                        markReady: markReady
-                    )
-                    guard request.isActive else { continue }
-                    switch preparation {
-                    case .success:
-                        isPrepared = true
-                    case .failure(let error):
-                        request.complete(with: .failure(error))
-                        if Task.isCancelled {
-                            break signalLoop
-                        }
-                        continue
-                    }
-                }
+        for await _ in signals {
+            let shouldContinue = await drainQueue(
+                driver: driver,
+                lane: lane,
+                markReady: markReady,
+                isPrepared: &isPrepared
+            )
+            guard shouldContinue else { return }
+        }
+    }
 
-                await translate(request, driver: driver, lane: lane)
-                if Task.isCancelled {
-                    break signalLoop
+    /// キューが空になるまで依頼を処理する。タスクがキャンセルされたら`false`を返す。
+    private func drainQueue(
+        driver: any LocalTranslationSessionDriving,
+        lane: TranslationLane,
+        markReady: @escaping (Bool) -> Void,
+        isPrepared: inout Bool
+    ) async -> Bool {
+        while let request = lane.takeNext() {
+            if !isPrepared {
+                let preparation = await prepare(
+                    for: request,
+                    driver: driver,
+                    lane: lane,
+                    markReady: markReady
+                )
+                guard request.isActive else { continue }
+                switch preparation {
+                case .success:
+                    isPrepared = true
+                case .failure(let error):
+                    request.complete(with: .failure(error))
+                    if Task.isCancelled {
+                        return false
+                    }
+                    continue
                 }
             }
+
+            await translate(request, driver: driver, lane: lane)
+            if Task.isCancelled {
+                return false
+            }
         }
+        return true
     }
 
     private func prepare(
@@ -530,45 +255,5 @@ final class LocalTranslationService: LocalTranslationServicing {
         }
         lane.finishActiveWork(request: request)
         request.complete(with: result)
-    }
-}
-
-struct LocalTranslationHostView: View {
-    let service: LocalTranslationService
-
-    private let japanese = Locale.Language(identifier: "ja")
-    private let english = Locale.Language(identifier: "en")
-
-    var body: some View {
-        Color.clear
-            .frame(width: 1, height: 1)
-            .translationTask(japaneseToEnglishConfiguration) { session in
-                await service.runJapaneseToEnglish(session: session)
-            }
-            .translationTask(englishToJapaneseConfiguration) { session in
-                await service.runEnglishToJapanese(session: session)
-            }
-    }
-
-    private var japaneseToEnglishConfiguration: TranslationSession.Configuration {
-        configuration(source: japanese, target: english)
-    }
-
-    private var englishToJapaneseConfiguration: TranslationSession.Configuration {
-        configuration(source: english, target: japanese)
-    }
-
-    private func configuration(
-        source: Locale.Language,
-        target: Locale.Language
-    ) -> TranslationSession.Configuration {
-        if #available(macOS 26.4, *) {
-            return TranslationSession.Configuration(
-                source: source,
-                target: target,
-                preferredStrategy: .lowLatency
-            )
-        }
-        return TranslationSession.Configuration(source: source, target: target)
     }
 }

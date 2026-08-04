@@ -18,6 +18,7 @@ final class AppCoordinator: NSObject {
     )
     private let hotKeys = HotKeyManager()
     private var settingsWindow: NSWindow?
+    private var lastSnapshot = SubtitleSnapshot.empty
 
     func start() {
         NSApp.setActivationPolicy(.accessory)
@@ -106,8 +107,6 @@ final class AppCoordinator: NSObject {
             NSApp.terminate(nil)
         }
     }
-
-    private var lastSnapshot = SubtitleSnapshot.empty
 
     private func registerHotKeys() {
         hotKeys.handler = { [weak self] action in

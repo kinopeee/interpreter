@@ -13,7 +13,7 @@
 - `Audio/LocalSpeechRecognitionService.swift`: AVAudioEngine、SpeechAnalyzer、日英2レーン。
 - `Audio/SpokenLanguage.swift`: 言語判定と文単位のレーン固定。
 - `Translation/LocalTranslationService.swift`: SwiftUI `translationTask`に結び付いた2方向のApple Translation。
-- `Realtime/TranslationSession.swift`: 認識、表示スロットリング、翻訳、状態遷移を統合。
+- `Realtime/InterpretationSession.swift`: 認識、表示スロットリング、翻訳、状態遷移を統合。
 - `Subtitles/`: current/previous字幕集約、透明オーバーレイ、録音コントロール。
 - `project.yml`: XcodeGen設定、Info.plist項目、権限説明の正本。
 
