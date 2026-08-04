@@ -5,20 +5,71 @@ import XCTest
 
 @MainActor
 final class LocalTranslationServiceTests: XCTestCase {
-    func testFinalRequestPreemptsActiveLiveTranslation() async throws {
-        // Given: 取消後に遅い成功結果を返すlive翻訳が実行中のサービス
+    func testLiveAndFinalRequestsRouteToIndependentLanes() async throws {
+        // Given: live/finalそれぞれ別driverで動く日英翻訳サービス
         let service = LocalTranslationService()
-        let driver = ControlledTranslationSession()
+        let liveDriver = ControlledTranslationSession()
+        let finalDriver = ControlledTranslationSession()
+        liveDriver.translations["live"] = "live translation"
+        finalDriver.translations["final"] = "final translation"
+        let liveRunTask = Task { @MainActor in
+            await service.runJapaneseToEnglishLive(driver: liveDriver)
+        }
+        let finalRunTask = Task { @MainActor in
+            await service.runJapaneseToEnglishFinal(driver: finalDriver)
+        }
+        defer {
+            liveRunTask.cancel()
+            finalRunTask.cancel()
+        }
+        await liveDriver.waitUntilPrepareCallCount(1)
+        await finalDriver.waitUntilPrepareCallCount(1)
+
+        // When: 同じ方向へliveとfinalを投入する
+        let liveTranslation = try await service.translate(
+            "live",
+            from: .japanese,
+            priority: .live
+        )
+        let finalTranslation = try await service.translate(
+            "final",
+            from: .japanese,
+            priority: .final
+        )
+
+        // Then: 各優先度が自分のレーン(driver)だけへ届く
+        XCTAssertEqual(liveTranslation, "live translation")
+        XCTAssertEqual(finalTranslation, "final translation")
+        XCTAssertEqual(liveDriver.translationCalls, ["live"])
+        XCTAssertEqual(finalDriver.translationCalls, ["final"])
+        liveRunTask.cancel()
+        finalRunTask.cancel()
+        await liveRunTask.value
+        await finalRunTask.value
+    }
+
+    func testFinalProceedsWhileLiveTranslationIsInFlight() async throws {
+        // Given: live翻訳が完了待ちでブロックされている独立レーン構成
+        let service = LocalTranslationService()
+        let liveDriver = ControlledTranslationSession()
+        let finalDriver = ControlledTranslationSession()
         let liveGate = ControlledTranslationGate(
             cancellationResult: .success("stale live translation")
         )
-        driver.translationGates["live"] = liveGate
-        driver.translations["final"] = "final translation"
-        let runTask = Task { @MainActor in
-            await service.runJapaneseToEnglish(driver: driver)
+        liveDriver.translationGates["live"] = liveGate
+        finalDriver.translations["final"] = "final translation"
+        let liveRunTask = Task { @MainActor in
+            await service.runJapaneseToEnglishLive(driver: liveDriver)
         }
-        defer { runTask.cancel() }
-        await driver.waitUntilPrepareCallCount(1)
+        let finalRunTask = Task { @MainActor in
+            await service.runJapaneseToEnglishFinal(driver: finalDriver)
+        }
+        defer {
+            liveRunTask.cancel()
+            finalRunTask.cancel()
+        }
+        await liveDriver.waitUntilPrepareCallCount(1)
+        await finalDriver.waitUntilPrepareCallCount(1)
         let liveTask = Task { @MainActor in
             try await service.translate(
                 "live",
@@ -26,31 +77,30 @@ final class LocalTranslationServiceTests: XCTestCase {
                 priority: .live
             )
         }
-        await driver.waitUntilTranslationStarted("live")
+        await liveDriver.waitUntilTranslationStarted("live")
 
-        // When: 確定文を同じ翻訳レーンへ投入する
+        // When: live実行中に確定文を投入する
         let finalTranslation = try await service.translate(
             "final",
             from: .japanese,
             priority: .final
         )
-        let liveResult = await liveTask.result
 
-        // Then: liveの呼出元だけを取り消し、遅い成功を無視してfinalを完了する
+        // Then: finalはliveを待たず完了し、live作業も取り消さない
         XCTAssertEqual(finalTranslation, "final translation")
-        XCTAssertEqual(driver.translationCalls, ["live", "final"])
-        XCTAssertEqual(liveGate.cancellationCount, 1)
-        guard case .failure(let liveError) = liveResult else {
-            return XCTFail("live翻訳はCancellationErrorで終了する必要があります")
-        }
-        XCTAssertTrue(liveError is CancellationError)
-        XCTAssertFalse(liveError.localizedDescription.isEmpty)
-        runTask.cancel()
-        await runTask.value
+        XCTAssertEqual(finalDriver.translationCalls, ["final"])
+        XCTAssertEqual(liveGate.cancellationCount, 0)
+        XCTAssertFalse(liveTask.isCancelled)
+        liveRunTask.cancel()
+        finalRunTask.cancel()
+        liveTask.cancel()
+        await liveRunTask.value
+        await finalRunTask.value
+        _ = await liveTask.result
     }
 
     func testPreparationFailureRetriesOnLaterRequests() async throws {
-        // Given: 起動時と最初の要求で準備に失敗し、次の要求で回復するsession
+        // Given: 起動時と最初の要求で準備に失敗し、次の要求で回復するfinal session
         let service = LocalTranslationService()
         let driver = ControlledTranslationSession(
             prepareResults: [
@@ -61,7 +111,7 @@ final class LocalTranslationServiceTests: XCTestCase {
         )
         driver.translations["second"] = "translated second"
         let runTask = Task { @MainActor in
-            await service.runJapaneseToEnglish(driver: driver)
+            await service.runJapaneseToEnglishFinal(driver: driver)
         }
         defer { runTask.cancel() }
         await driver.waitUntilPrepareCallCount(1)
@@ -94,52 +144,21 @@ final class LocalTranslationServiceTests: XCTestCase {
         await runTask.value
     }
 
-    func testFinalRequestPreemptsLivePreparationRetry() async throws {
-        // Given: 初回準備失敗後、live要求の再準備が待機しているsession
+    func testFinalReadyFlagIgnoresLiveLanePreparation() async throws {
+        // Given: liveレーンだけ準備済みで、finalレーンは未準備のサービス
         let service = LocalTranslationService()
-        let driver = ControlledTranslationSession(
-            prepareResults: [
-                .failure(ControlledTranslationError.preparationFailed)
-            ]
-        )
-        let preparationGate = ControlledTranslationGate(
-            cancellationResult: .failure(CancellationError())
-        )
-        driver.preparationGates[2] = preparationGate
-        driver.translations["final"] = "final translation"
-        let runTask = Task { @MainActor in
-            await service.runJapaneseToEnglish(driver: driver)
+        let liveDriver = ControlledTranslationSession()
+        let liveRunTask = Task { @MainActor in
+            await service.runJapaneseToEnglishLive(driver: liveDriver)
         }
-        defer { runTask.cancel() }
-        await driver.waitUntilPrepareCallCount(1)
-        let liveTask = Task { @MainActor in
-            try await service.translate(
-                "live",
-                from: .japanese,
-                priority: .live
-            )
-        }
-        await driver.waitUntilPrepareCallCount(2)
+        defer { liveRunTask.cancel() }
+        await liveDriver.waitUntilPrepareCallCount(1)
 
-        // When: live用の再準備中に確定文を投入する
-        let finalTranslation = try await service.translate(
-            "final",
-            from: .japanese,
-            priority: .final
-        )
-        let liveResult = await liveTask.result
-
-        // Then: 古い準備を取り消し、次の準備でfinalだけを翻訳する
-        XCTAssertEqual(finalTranslation, "final translation")
-        XCTAssertEqual(preparationGate.cancellationCount, 1)
-        XCTAssertEqual(driver.prepareCallCount, 3)
-        XCTAssertEqual(driver.translationCalls, ["final"])
-        guard case .failure(let error) = liveResult else {
-            return XCTFail("live要求はCancellationErrorで終了する必要があります")
-        }
-        XCTAssertTrue(error is CancellationError)
-        runTask.cancel()
-        await runTask.value
+        // When: liveレーンの準備完了を待つ
+        // Then: readyフラグはfinalセッションの状態だけを表す
+        XCTAssertFalse(service.isJapaneseToEnglishReady)
+        liveRunTask.cancel()
+        await liveRunTask.value
     }
 
     func testFinalQueueOverflowReturnsExplicitError() async {

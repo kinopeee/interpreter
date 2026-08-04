@@ -103,6 +103,10 @@ final class InterpretationSession {
     private let finalTranslationRetryDelayNanoseconds: UInt64
     private let activeTickerIntervalNanoseconds: UInt64
     private let idleTickerIntervalNanoseconds: UInt64
+    /// live訳文を一度表示したら次の書き換えまで最低これだけ保持する。
+    /// 読んでいる最中に訳文全体が語順ごと書き換わるちらつきを抑える。
+    /// 確定訳(final)の表示には適用しない。
+    private let liveTranslationDisplayHoldInterval: TimeInterval
 
     private(set) var state: TranslationState = .idle {
         didSet {
@@ -123,6 +127,7 @@ final class InterpretationSession {
     private var transcriptionRenderTask: Task<Void, Never>?
     private var pendingTranscription: PendingTranscription?
     private var lastTranscriptionRenderedAt = Date.distantPast
+    private var lastLiveTranslationDisplayedAt = Date.distantPast
     /// start/stopの世代番号。起動待ちの間に停止が割り込んだ場合、
     /// 古い起動処理が状態を上書きするのを防ぐ。
     private var lifecycleGeneration = 0
@@ -136,7 +141,8 @@ final class InterpretationSession {
         maxFinalTranslationAttempts: Int = 5,
         finalTranslationRetryDelayNanoseconds: UInt64 = 250_000_000,
         activeTickerIntervalNanoseconds: UInt64 = 200_000_000,
-        idleTickerIntervalNanoseconds: UInt64 = 200_000_000
+        idleTickerIntervalNanoseconds: UInt64 = 200_000_000,
+        liveTranslationDisplayHoldNanoseconds: UInt64 = 1_500_000_000
     ) {
         precondition(maxPendingFinalTranslations > 0)
         precondition(maxFinalTranslationAttempts > 0)
@@ -148,6 +154,8 @@ final class InterpretationSession {
         self.finalTranslationRetryDelayNanoseconds = finalTranslationRetryDelayNanoseconds
         self.activeTickerIntervalNanoseconds = activeTickerIntervalNanoseconds
         self.idleTickerIntervalNanoseconds = idleTickerIntervalNanoseconds
+        self.liveTranslationDisplayHoldInterval =
+            TimeInterval(liveTranslationDisplayHoldNanoseconds) / 1_000_000_000
         speechService.delegate = self
     }
 
@@ -160,6 +168,7 @@ final class InterpretationSession {
         cancelTransientWork()
         currentUtterance.reset()
         finalTranslationQueue.removeAll()
+        lastLiveTranslationDisplayedAt = .distantPast
         aggregator.setStatusBanner("ローカル音声認識を準備中…")
         publishSubtitles()
 
@@ -331,16 +340,28 @@ final class InterpretationSession {
                     from: language,
                     priority: .live
                 )
-                guard !Task.isCancelled,
-                      self.currentUtterance.applyTranslation(
-                          translated,
-                          generation: generation,
-                          sourceText: text
-                      )
-                else {
+                guard !Task.isCancelled else { return }
+
+                // 前回のlive訳表示から最低保持時間が経つまで書き換えを待つ。
+                // 待機中に原文が更新されればこのタスクごとキャンセルされ、
+                // 中間の訳文は表示せず次の(より長い)訳文へ進む。
+                let elapsed = Date().timeIntervalSince(self.lastLiveTranslationDisplayedAt)
+                let holdRemaining = self.liveTranslationDisplayHoldInterval - elapsed
+                if holdRemaining > 0 {
+                    try? await Task.sleep(
+                        nanoseconds: UInt64(holdRemaining * 1_000_000_000)
+                    )
+                    guard !Task.isCancelled else { return }
+                }
+                guard self.currentUtterance.applyTranslation(
+                    translated,
+                    generation: generation,
+                    sourceText: text
+                ) else {
                     return
                 }
 
+                self.lastLiveTranslationDisplayedAt = Date()
                 self.publishCurrentUtterance(isTranslationCurrent: true)
             } catch is CancellationError {
                 return
@@ -389,13 +410,42 @@ final class InterpretationSession {
         while !finalTranslationQueue.isEmpty {
             let request = finalTranslationQueue.removeFirst()
             do {
+                // 翻訳器への入力だけを正規化する。画面の原文は認識結果のまま残す。
+                let translationSource = TranslationSourceNormalizer
+                    .normalizeForFinalTranslation(
+                        request.sourceText,
+                        language: request.language
+                    )
                 let translated = try await translationService.translate(
-                    request.sourceText,
+                    translationSource,
                     from: request.language,
                     priority: .final
                 )
                 let clearsCurrent =
                     request.sourceGeneration == currentUtterance.generation
+
+                // 未翻訳echoは確定表示しない(原文だけの確定はAGENTS.mdの不変条件違反)。
+                // 同じ入力を再翻訳しても同じechoが返るため、リトライもしない。
+                if TranslationEchoDetector.isEcho(
+                    source: request.sourceText,
+                    translated: translated
+                ) {
+                    AppLogger.general.notice(
+                        "Dropping untranslated echo pair from final translation"
+                    )
+                    if clearsCurrent {
+                        currentUtterance.clearContent()
+                        aggregator.replaceCurrent(
+                            sourceText: "",
+                            translatedText: "",
+                            isTranslationCurrent: false,
+                            canFinalize: false
+                        )
+                        publishSubtitles()
+                    }
+                    continue
+                }
+
                 if clearsCurrent {
                     currentUtterance.clearContent()
                 }

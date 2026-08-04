@@ -109,6 +109,78 @@ final class SubtitleAggregatorTests: XCTestCase {
         XCTAssertNil(gone.previous)
     }
 
+    func testFinalizePairWithClearCurrentKeepsPairInCurrentSlot() {
+        // Given: 空の字幕集約器
+        let aggregator = SubtitleAggregator()
+
+        // When: 現在の発話に対応する確定ペアをclearCurrent付きで確定する
+        let snapshot = aggregator.finalizePair(
+            sourceText: "確定文",
+            translatedText: "Finalized sentence",
+            clearCurrent: true
+        )
+
+        // Then: previousへ移さず、currentスロットにその場確定で残す
+        XCTAssertEqual(snapshot.current.sourceText, "確定文")
+        XCTAssertEqual(snapshot.current.translatedText, "Finalized sentence")
+        XCTAssertEqual(snapshot.current.state, .finalized)
+        XCTAssertNil(snapshot.previous)
+    }
+
+    func testNextUtterancePromotesInPlacePairToPrevious() {
+        // Given: currentスロットにその場確定ペアを保持する字幕集約器
+        let aggregator = SubtitleAggregator()
+        let now = Date()
+        _ = aggregator.finalizePair(
+            sourceText: "確定文",
+            translatedText: "Finalized sentence",
+            clearCurrent: true,
+            now: now
+        )
+
+        // When: 次の発話がcurrentへ入る
+        let snapshot = aggregator.replaceCurrent(
+            sourceText: "次の発話",
+            translatedText: "",
+            isTranslationCurrent: false,
+            canFinalize: false,
+            now: now.addingTimeInterval(1)
+        )
+
+        // Then: その場確定ペアをpreviousへ退避し、フル保持時間を与える
+        XCTAssertEqual(snapshot.previous?.sourceText, "確定文")
+        XCTAssertEqual(snapshot.previous?.translatedText, "Finalized sentence")
+        XCTAssertEqual(snapshot.previousOpacity, 1)
+        XCTAssertEqual(snapshot.current.sourceText, "次の発話")
+        XCTAssertEqual(snapshot.current.state, .live)
+    }
+
+    func testInPlacePairExpiresToPreviousAfterHoldInterval() {
+        // Given: 5秒保持・0.3秒フェード設定で、その場確定ペアを保持する字幕集約器
+        var config = SubtitleAggregatorConfig()
+        config.previousHoldInterval = 5
+        config.fadeDuration = 0.3
+        let aggregator = SubtitleAggregator(config: config)
+        let now = Date()
+        _ = aggregator.finalizePair(
+            sourceText: "確定文",
+            translatedText: "Finalized sentence",
+            clearCurrent: true,
+            now: now
+        )
+
+        // When: 保持時間の手前と超過後にtickする
+        let held = aggregator.tick(now: now.addingTimeInterval(4.9))
+        let expired = aggregator.tick(now: now.addingTimeInterval(5.1))
+
+        // Then: 保持中はその場に残し、超過後はpreviousへ退避して即フェードを開始する
+        XCTAssertEqual(held.current.sourceText, "確定文")
+        XCTAssertNil(held.previous)
+        XCTAssertTrue(expired.current.isEmpty)
+        XCTAssertEqual(expired.previous?.sourceText, "確定文")
+        XCTAssertLessThan(expired.previousOpacity, 1)
+    }
+
     func testForceFinalizeOnStop() {
         // Given: 録音停止前の原文・翻訳ペア
         let aggregator = SubtitleAggregator()

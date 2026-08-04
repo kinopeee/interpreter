@@ -64,8 +64,8 @@ final class InterpretationSessionTests: XCTestCase {
         // Given: 確定文Aの翻訳が処理中のセッション
         let speechService = FakeSpeechRecognitionService()
         let translationService = FakeTranslationService()
-        translationService.suspendedFinalTexts.insert("文A")
-        translationService.translations["文A"] = "Sentence A"
+        translationService.suspendedFinalTexts.insert("文A。")
+        translationService.translations["文A。"] = "Sentence A"
         let delegate = InterpretationSessionDelegateSpy()
         let session = InterpretationSession(
             translationService: translationService,
@@ -74,12 +74,12 @@ final class InterpretationSessionTests: XCTestCase {
         session.delegate = delegate
         await session.start()
         speechService.emit(text: "文A", language: .japanese, isFinal: true)
-        await translationService.waitUntilFinalRequested("文A")
+        await translationService.waitUntilFinalRequested("文A。")
 
         // When: 翻訳完了前に次の暫定文Bが届く
         speechService.emit(text: "文B", language: .japanese, isFinal: false)
         await delegate.waitUntilCurrentSource("文B")
-        translationService.completeFinal("文A")
+        translationService.completeFinal("文A。")
         await delegate.waitUntilPreviousSource("文A")
 
         // Then: 文Aを確定表示し、文Bをcurrentとして維持する
@@ -87,7 +87,187 @@ final class InterpretationSessionTests: XCTestCase {
         XCTAssertEqual(snapshot.previous?.sourceText, "文A")
         XCTAssertEqual(snapshot.previous?.translatedText, "Sentence A")
         XCTAssertEqual(snapshot.current.sourceText, "文B")
-        XCTAssertEqual(translationService.finalRequests, ["文A"])
+        XCTAssertEqual(translationService.finalRequests, ["文A。"])
+        await session.stop()
+    }
+
+    func testFinalizedPairStaysInPlaceThenMovesToPreviousOnNextUtterance() async throws {
+        // Given: 文Aの確定訳が完了するセッション
+        let speechService = FakeSpeechRecognitionService()
+        let translationService = FakeTranslationService()
+        translationService.translations["文A。"] = "Sentence A"
+        let delegate = InterpretationSessionDelegateSpy()
+        let session = InterpretationSession(
+            translationService: translationService,
+            speechService: speechService
+        )
+        session.delegate = delegate
+        await session.start()
+
+        // When: 文Aを確定し、その後に次の発話文Bが始まる
+        speechService.emit(text: "文A", language: .japanese, isFinal: true)
+        await delegate.waitUntilCurrentTranslation("Sentence A")
+        let inPlaceSnapshot = try XCTUnwrap(delegate.lastSnapshot)
+        speechService.emit(text: "文B", language: .japanese, isFinal: false)
+        await delegate.waitUntilCurrentSource("文B")
+
+        // Then: 確定直後はcurrentスロットにその場表示し、次の発話開始でpreviousへ退避する
+        XCTAssertEqual(inPlaceSnapshot.current.sourceText, "文A")
+        XCTAssertEqual(inPlaceSnapshot.current.translatedText, "Sentence A")
+        XCTAssertEqual(inPlaceSnapshot.current.state, .finalized)
+        XCTAssertNil(inPlaceSnapshot.previous)
+        let promoted = try XCTUnwrap(delegate.lastSnapshot)
+        XCTAssertEqual(promoted.previous?.sourceText, "文A")
+        XCTAssertEqual(promoted.previous?.translatedText, "Sentence A")
+        XCTAssertEqual(promoted.current.sourceText, "文B")
+        await session.stop()
+    }
+
+    func testUntranslatedEchoFinalIsDroppedWithoutFinalizing() async throws {
+        // Given: 文Aの確定訳が原文echoで返り、文Bは正常に翻訳されるセッション
+        let speechService = FakeSpeechRecognitionService()
+        let translationService = FakeTranslationService()
+        translationService.translations["文A。"] = "文A。"
+        translationService.translations["文B。"] = "Sentence B"
+        let delegate = InterpretationSessionDelegateSpy()
+        let session = InterpretationSession(
+            translationService: translationService,
+            speechService: speechService
+        )
+        session.delegate = delegate
+        await session.start()
+
+        // When: echoになる文Aを確定し、続けて文Bを確定する
+        speechService.emit(text: "文A", language: .japanese, isFinal: true)
+        speechService.emit(text: "文B", language: .japanese, isFinal: true)
+        await delegate.waitUntilCurrentTranslation("Sentence B")
+
+        // Then: 文Aのペアを確定表示へ出さず、文Bだけをその場確定する
+        XCTAssertEqual(translationService.finalRequests, ["文A。", "文B。"])
+        let snapshot = try XCTUnwrap(delegate.lastSnapshot)
+        XCTAssertEqual(snapshot.current.sourceText, "文B")
+        XCTAssertEqual(snapshot.current.translatedText, "Sentence B")
+        XCTAssertFalse(
+            delegate.snapshots.contains { $0.previous?.sourceText == "文A" }
+        )
+        XCTAssertFalse(
+            delegate.snapshots.contains { $0.current.translatedText == "文A。" }
+        )
+        await session.stop()
+    }
+
+    func testUntranslatedEchoClearsCurrentUtterance() async throws {
+        // Given: 唯一の確定文がechoで返るセッション
+        let speechService = FakeSpeechRecognitionService()
+        let translationService = FakeTranslationService()
+        translationService.translations["文A。"] = "文A。"
+        let delegate = InterpretationSessionDelegateSpy()
+        let session = InterpretationSession(
+            translationService: translationService,
+            speechService: speechService
+        )
+        session.delegate = delegate
+        await session.start()
+
+        // When: echoになる文Aだけを確定する
+        speechService.emit(text: "文A", language: .japanese, isFinal: true)
+        await delegate.waitUntilCurrentSource("文A")
+        await delegate.waitUntilCurrentSource("")
+
+        // Then: previousへ確定せず、currentの原文も消して画面に残さない
+        let snapshot = try XCTUnwrap(delegate.lastSnapshot)
+        XCTAssertTrue(snapshot.current.isEmpty)
+        XCTAssertNil(snapshot.previous)
+        await session.stop()
+    }
+
+    func testLiveTranslationHoldSuppressesIntermediateRewriteUntilFinal() async throws {
+        // Given: live訳の表示保持を3秒に設定し、最初のlive訳を表示済みのセッション
+        let speechService = FakeSpeechRecognitionService()
+        let translationService = FakeTranslationService()
+        translationService.translations["文A"] = "Sentence A"
+        translationService.translations["文A続き"] = "Sentence A cont"
+        translationService.translations["文A続き。"] = "Sentence A continued final"
+        let delegate = InterpretationSessionDelegateSpy()
+        let session = InterpretationSession(
+            translationService: translationService,
+            speechService: speechService,
+            liveTranslationDisplayHoldNanoseconds: 3_000_000_000
+        )
+        session.delegate = delegate
+        await session.start()
+        speechService.emit(text: "文A", language: .japanese, isFinal: false)
+        await delegate.waitUntilCurrentTranslation("Sentence A")
+
+        // When: 保持時間内に原文が伸び、そのlive訳の表示待ち中に文が確定する
+        speechService.emit(text: "文A続き", language: .japanese, isFinal: false)
+        await translationService.waitUntilLiveRequested("文A続き")
+        speechService.emit(text: "文A続き", language: .japanese, isFinal: true)
+        await delegate.waitUntilCurrentTranslation("Sentence A continued final")
+
+        // Then: 保持中の中間live訳は一度も表示せず、確定訳だけを表示する
+        XCTAssertTrue(translationService.liveRequests.contains("文A続き"))
+        XCTAssertFalse(
+            delegate.snapshots.contains {
+                $0.current.translatedText == "Sentence A cont"
+            }
+        )
+        XCTAssertEqual(
+            delegate.lastSnapshot?.current.translatedText,
+            "Sentence A continued final"
+        )
+        await session.stop()
+    }
+
+    func testFirstLiveTranslationDisplaysWithoutHoldDelay() async throws {
+        // Given: live訳の表示保持を長く設定した起動直後のセッション
+        let speechService = FakeSpeechRecognitionService()
+        let translationService = FakeTranslationService()
+        translationService.translations["文A"] = "Sentence A"
+        let delegate = InterpretationSessionDelegateSpy()
+        let session = InterpretationSession(
+            translationService: translationService,
+            speechService: speechService,
+            liveTranslationDisplayHoldNanoseconds: 60_000_000_000
+        )
+        session.delegate = delegate
+        await session.start()
+
+        // When: 最初のlive訳が完了する
+        speechService.emit(text: "文A", language: .japanese, isFinal: false)
+        await delegate.waitUntilCurrentTranslation("Sentence A")
+
+        // Then: 発話1文目の訳は保持間隔を待たず即時に表示する
+        XCTAssertEqual(delegate.lastSnapshot?.current.translatedText, "Sentence A")
+        await session.stop()
+    }
+
+    func testFinalTranslationUsesNormalizedSourceWithoutChangingDisplay() async throws {
+        // Given: 文頭フィラーと句読点なしの確定文を受け付けるセッション
+        let speechService = FakeSpeechRecognitionService()
+        let translationService = FakeTranslationService()
+        translationService.translations["今日は晴れです。"] = "It is sunny today."
+        let delegate = InterpretationSessionDelegateSpy()
+        let session = InterpretationSession(
+            translationService: translationService,
+            speechService: speechService
+        )
+        session.delegate = delegate
+        await session.start()
+
+        // When: フィラー付き原文を確定する
+        speechService.emit(
+            text: "えーと、今日は晴れです",
+            language: .japanese,
+            isFinal: true
+        )
+        await delegate.waitUntilCurrentTranslation("It is sunny today.")
+
+        // Then: 翻訳器へは正規化済み文を渡し、表示原文は認識結果のまま
+        XCTAssertEqual(translationService.finalRequests, ["今日は晴れです。"])
+        let snapshot = try XCTUnwrap(delegate.lastSnapshot)
+        XCTAssertEqual(snapshot.current.sourceText, "えーと、今日は晴れです")
+        XCTAssertEqual(snapshot.current.translatedText, "It is sunny today.")
         await session.stop()
     }
 
@@ -99,8 +279,8 @@ final class InterpretationSessionTests: XCTestCase {
             language: .japanese
         )
         let translationService = FakeTranslationService()
-        translationService.suspendedFinalTexts.insert("最後の文")
-        translationService.translations["最後の文"] = "The final sentence"
+        translationService.suspendedFinalTexts.insert("最後の文。")
+        translationService.translations["最後の文。"] = "The final sentence"
         let delegate = InterpretationSessionDelegateSpy()
         let session = InterpretationSession(
             translationService: translationService,
@@ -111,9 +291,9 @@ final class InterpretationSessionTests: XCTestCase {
 
         // When: 録音を停止してfinal認識と翻訳をドレインする
         let stopTask = Task { await session.stop() }
-        await translationService.waitUntilFinalRequested("最後の文")
+        await translationService.waitUntilFinalRequested("最後の文。")
         XCTAssertEqual(session.state, .closing)
-        translationService.completeFinal("最後の文")
+        translationService.completeFinal("最後の文。")
         await stopTask.value
 
         // Then: finalの原文・訳文ペアを確定してからidleへ遷移する
@@ -122,15 +302,15 @@ final class InterpretationSessionTests: XCTestCase {
         XCTAssertEqual(snapshot.previous?.sourceText, "最後の文")
         XCTAssertEqual(snapshot.previous?.translatedText, "The final sentence")
         XCTAssertTrue(snapshot.current.isEmpty)
-        XCTAssertEqual(translationService.finalRequests, ["最後の文"])
+        XCTAssertEqual(translationService.finalRequests, ["最後の文。"])
     }
 
     func testCancellationErrorDoesNotAbandonFollowingFinalTranslation() async {
         // Given: 確定文AだけがCancellationErrorとなる翻訳キュー
         let speechService = FakeSpeechRecognitionService()
         let translationService = FakeTranslationService()
-        translationService.cancelledFinalTexts.insert("文A")
-        translationService.translations["文B"] = "Sentence B"
+        translationService.cancelledFinalTexts.insert("文A。")
+        translationService.translations["文B。"] = "Sentence B"
         let delegate = InterpretationSessionDelegateSpy()
         let session = InterpretationSession(
             translationService: translationService,
@@ -142,11 +322,12 @@ final class InterpretationSessionTests: XCTestCase {
         // When: 文Aと文Bを連続して確定キューへ入れる
         speechService.emit(text: "文A", language: .japanese, isFinal: true)
         speechService.emit(text: "文B", language: .japanese, isFinal: true)
-        await delegate.waitUntilPreviousSource("文B")
+        await delegate.waitUntilCurrentTranslation("Sentence B")
 
-        // Then: 文Aの取消後も文Bを処理して確定表示する
-        XCTAssertEqual(translationService.finalRequests, ["文A", "文B"])
-        XCTAssertEqual(delegate.lastSnapshot?.previous?.translatedText, "Sentence B")
+        // Then: 文Aの取消後も文Bを処理してその場確定表示する
+        XCTAssertEqual(translationService.finalRequests, ["文A。", "文B。"])
+        XCTAssertEqual(delegate.lastSnapshot?.current.translatedText, "Sentence B")
+        XCTAssertEqual(delegate.lastSnapshot?.current.state, .finalized)
         await session.stop()
     }
 
@@ -154,8 +335,8 @@ final class InterpretationSessionTests: XCTestCase {
         // Given: 確定翻訳が2回だけ準備失敗し、3回目で成功するセッション
         let speechService = FakeSpeechRecognitionService()
         let translationService = FakeTranslationService()
-        translationService.translations["文A"] = "Sentence A"
-        translationService.finalFailureCounts["文A"] = 2
+        translationService.translations["文A。"] = "Sentence A"
+        translationService.finalFailureCounts["文A。"] = 2
         let delegate = InterpretationSessionDelegateSpy()
         let session = InterpretationSession(
             translationService: translationService,
@@ -168,14 +349,15 @@ final class InterpretationSessionTests: XCTestCase {
 
         // When: 確定文Aを1件だけキューへ入れる
         speechService.emit(text: "文A", language: .japanese, isFinal: true)
-        await delegate.waitUntilPreviousSource("文A")
+        await delegate.waitUntilCurrentTranslation("Sentence A")
 
-        // Then: 一時失敗後も同じ確定文を再試行し、原文・訳文ペアを失わない
-        XCTAssertEqual(translationService.finalRequests, ["文A", "文A", "文A"])
+        // Then: 一時失敗後も同じ確定文を再試行し、原文・訳文ペアをその場確定で表示する
+        XCTAssertEqual(translationService.finalRequests, ["文A。", "文A。", "文A。"])
         let snapshot = try XCTUnwrap(delegate.lastSnapshot)
-        XCTAssertEqual(snapshot.previous?.sourceText, "文A")
-        XCTAssertEqual(snapshot.previous?.translatedText, "Sentence A")
-        XCTAssertTrue(snapshot.current.isEmpty)
+        XCTAssertEqual(snapshot.current.sourceText, "文A")
+        XCTAssertEqual(snapshot.current.translatedText, "Sentence A")
+        XCTAssertEqual(snapshot.current.state, .finalized)
+        XCTAssertNil(snapshot.previous)
         await session.stop()
     }
 
@@ -183,8 +365,8 @@ final class InterpretationSessionTests: XCTestCase {
         // Given: 文Aの確定翻訳が常に失敗し、文Bは成功するセッション
         let speechService = FakeSpeechRecognitionService()
         let translationService = FakeTranslationService()
-        translationService.translations["文B"] = "Sentence B"
-        translationService.finalFailureCounts["文A"] = 100
+        translationService.translations["文B。"] = "Sentence B"
+        translationService.finalFailureCounts["文A。"] = 100
         let delegate = InterpretationSessionDelegateSpy()
         let session = InterpretationSession(
             translationService: translationService,
@@ -198,13 +380,14 @@ final class InterpretationSessionTests: XCTestCase {
         // When: 失敗し続ける文Aのあとに文Bを確定する
         speechService.emit(text: "文A", language: .japanese, isFinal: true)
         speechService.emit(text: "文B", language: .japanese, isFinal: true)
-        await delegate.waitUntilPreviousSource("文B")
+        await delegate.waitUntilCurrentTranslation("Sentence B")
 
         // Then: 文Aは再試行上限で打ち切り、文Bの確定を阻害しない
-        XCTAssertEqual(translationService.finalRequests, ["文A", "文A", "文B"])
+        XCTAssertEqual(translationService.finalRequests, ["文A。", "文A。", "文B。"])
         let snapshot = try XCTUnwrap(delegate.lastSnapshot)
-        XCTAssertEqual(snapshot.previous?.sourceText, "文B")
-        XCTAssertEqual(snapshot.previous?.translatedText, "Sentence B")
+        XCTAssertEqual(snapshot.current.sourceText, "文B")
+        XCTAssertEqual(snapshot.current.translatedText, "Sentence B")
+        XCTAssertEqual(snapshot.current.state, .finalized)
         await session.stop()
     }
 
@@ -236,7 +419,7 @@ final class InterpretationSessionTests: XCTestCase {
         // Given: 日本語の暫定字幕を表示しているセッション
         let speechService = FakeSpeechRecognitionService()
         let translationService = FakeTranslationService()
-        translationService.translations["次の文"] = "The next sentence"
+        translationService.translations["次の文。"] = "The next sentence"
         let delegate = InterpretationSessionDelegateSpy()
         let session = InterpretationSession(
             translationService: translationService,
@@ -250,12 +433,12 @@ final class InterpretationSessionTests: XCTestCase {
         // When: 空finalで撤回した後、次の確定文が届く
         speechService.emit(text: "", language: .japanese, isFinal: true)
         speechService.emit(text: "次の文", language: .japanese, isFinal: true)
-        await delegate.waitUntilPreviousSource("次の文")
+        await delegate.waitUntilCurrentTranslation("The next sentence")
 
         // Then: 空文字をキューへ入れず、次の文だけを翻訳する
-        XCTAssertEqual(translationService.finalRequests, ["次の文"])
+        XCTAssertEqual(translationService.finalRequests, ["次の文。"])
         XCTAssertEqual(
-            delegate.lastSnapshot?.previous?.translatedText,
+            delegate.lastSnapshot?.current.translatedText,
             "The next sentence"
         )
         await session.stop()
@@ -365,9 +548,9 @@ final class InterpretationSessionTests: XCTestCase {
         // Given: 実行中の文Aと、1件だけ待機可能な確定翻訳キュー
         let speechService = FakeSpeechRecognitionService()
         let translationService = FakeTranslationService()
-        translationService.suspendedFinalTexts.insert("文A")
-        translationService.translations["文A"] = "Sentence A"
-        translationService.translations["文B"] = "Sentence B"
+        translationService.suspendedFinalTexts.insert("文A。")
+        translationService.translations["文A。"] = "Sentence A"
+        translationService.translations["文B。"] = "Sentence B"
         let delegate = InterpretationSessionDelegateSpy()
         let session = InterpretationSession(
             translationService: translationService,
@@ -377,17 +560,20 @@ final class InterpretationSessionTests: XCTestCase {
         session.delegate = delegate
         await session.start()
         speechService.emit(text: "文A", language: .japanese, isFinal: true)
-        await translationService.waitUntilFinalRequested("文A")
+        await translationService.waitUntilFinalRequested("文A。")
 
         // When: 待機文Bと上限超過の文Cを続けて投入する
         speechService.emit(text: "文B", language: .japanese, isFinal: true)
         speechService.emit(text: "文C", language: .japanese, isFinal: true)
-        translationService.completeFinal("文A")
-        await translationService.waitUntilFinalRequested("文B")
+        translationService.completeFinal("文A。")
+        await translationService.waitUntilFinalRequested("文B。")
+        // 文Cのレンダリングで発話世代が進んでいるため、文Bはin-place確定ではなく
+        // previousへ退避される(clearsCurrent = false の経路)。
         await delegate.waitUntilPreviousSource("文B")
 
         // Then: 文Cを保持せず、上限メッセージとA・Bだけを処理する
-        XCTAssertEqual(translationService.finalRequests, ["文A", "文B"])
+        XCTAssertEqual(translationService.finalRequests, ["文A。", "文B。"])
+        XCTAssertEqual(delegate.lastSnapshot?.previous?.sourceText, "文B")
         XCTAssertTrue(
             delegate.snapshots.contains {
                 $0.statusBanner == "確定翻訳の待機件数が上限に達しました"
@@ -403,7 +589,7 @@ final class InterpretationSessionTests: XCTestCase {
         config.fadeDuration = 0
         let speechService = FakeSpeechRecognitionService()
         let translationService = FakeTranslationService()
-        translationService.translations["完了文"] = "Completed sentence"
+        translationService.translations["完了文。"] = "Completed sentence"
         let delegate = InterpretationSessionDelegateSpy()
         let session = InterpretationSession(
             translationService: translationService,
@@ -415,7 +601,7 @@ final class InterpretationSessionTests: XCTestCase {
         session.delegate = delegate
         await session.start()
         speechService.emit(text: "完了文", language: .japanese, isFinal: true)
-        await delegate.waitUntilPreviousSource("完了文")
+        await delegate.waitUntilCurrentTranslation("Completed sentence")
 
         // When: 録音を停止し、idle中の消去tickを待つ
         await session.stop()
@@ -469,7 +655,7 @@ final class InterpretationSessionTests: XCTestCase {
         config.fadeDuration = 0
         let speechService = FakeSpeechRecognitionService()
         let translationService = FakeTranslationService()
-        translationService.translations["障害前の文"] = "Sentence before failure"
+        translationService.translations["障害前の文。"] = "Sentence before failure"
         let delegate = InterpretationSessionDelegateSpy()
         let session = InterpretationSession(
             translationService: translationService,
@@ -485,7 +671,7 @@ final class InterpretationSessionTests: XCTestCase {
             language: .japanese,
             isFinal: true
         )
-        await delegate.waitUntilPreviousSource("障害前の文")
+        await delegate.waitUntilCurrentTranslation("Sentence before failure")
 
         // When: 音声障害でstop後にerrorへ遷移し、字幕が消える
         speechService.emitFailure(LocalSpeechRecognitionError.audioFormatUnavailable)
