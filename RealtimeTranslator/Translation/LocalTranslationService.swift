@@ -1,4 +1,5 @@
 import Foundation
+import os
 import SwiftUI
 @preconcurrency import Translation
 
@@ -13,47 +14,172 @@ enum LocalTranslationError: Error, LocalizedError, Sendable {
     }
 }
 
-@MainActor
-final class LocalTranslationService {
-    private struct PendingRequest: @unchecked Sendable {
-        let text: String
-        let continuation: CheckedContinuation<String, Error>
+enum LocalTranslationPriority: Sendable {
+    case live
+    case final
+}
+
+struct LatestTranslationScheduler<Item> {
+    private var finalItems: [Item] = []
+    private var liveItem: Item?
+
+    var isEmpty: Bool {
+        finalItems.isEmpty && liveItem == nil
     }
 
-    private let jaToEnStream: AsyncStream<PendingRequest>
-    private let enToJaStream: AsyncStream<PendingRequest>
-    private let jaToEnContinuation: AsyncStream<PendingRequest>.Continuation
-    private let enToJaContinuation: AsyncStream<PendingRequest>.Continuation
+    /// Returns a superseded live item that the caller should cancel.
+    mutating func enqueue(_ item: Item, priority: LocalTranslationPriority) -> Item? {
+        switch priority {
+        case .live:
+            let superseded = liveItem
+            liveItem = item
+            return superseded
+        case .final:
+            let superseded = liveItem
+            liveItem = nil
+            finalItems.append(item)
+            return superseded
+        }
+    }
+
+    mutating func next() -> Item? {
+        if !finalItems.isEmpty {
+            return finalItems.removeFirst()
+        }
+        defer { liveItem = nil }
+        return liveItem
+    }
+}
+
+private final class PendingTranslationRequest: @unchecked Sendable {
+    private struct State {
+        var continuation: CheckedContinuation<String, Error>?
+        var isCancelled = false
+        var isFinished = false
+    }
+
+    let text: String
+    let priority: LocalTranslationPriority
+    private let state = OSAllocatedUnfairLock(initialState: State())
+
+    init(text: String, priority: LocalTranslationPriority) {
+        self.text = text
+        self.priority = priority
+    }
+
+    var isActive: Bool {
+        state.withLock { !$0.isCancelled && !$0.isFinished }
+    }
+
+    func install(_ continuation: CheckedContinuation<String, Error>) -> Bool {
+        let installed = state.withLock { state in
+            guard !state.isCancelled, !state.isFinished else { return false }
+            state.continuation = continuation
+            return true
+        }
+        if !installed {
+            continuation.resume(throwing: CancellationError())
+        }
+        return installed
+    }
+
+    func cancel() {
+        let continuation = state.withLock { state -> CheckedContinuation<String, Error>? in
+            guard !state.isCancelled, !state.isFinished else { return nil }
+            state.isCancelled = true
+            defer { state.continuation = nil }
+            return state.continuation
+        }
+        continuation?.resume(throwing: CancellationError())
+    }
+
+    func complete(with result: Result<String, Error>) {
+        let continuation = state.withLock { state -> CheckedContinuation<String, Error>? in
+            guard !state.isCancelled, !state.isFinished else { return nil }
+            state.isFinished = true
+            defer { state.continuation = nil }
+            return state.continuation
+        }
+        guard let continuation else { return }
+
+        switch result {
+        case .success(let text):
+            continuation.resume(returning: text)
+        case .failure(let error):
+            continuation.resume(throwing: error)
+        }
+    }
+}
+
+@MainActor
+private final class TranslationLane {
+    let signals: AsyncStream<Void>
+
+    private let signalContinuation: AsyncStream<Void>.Continuation
+    private var scheduler = LatestTranslationScheduler<PendingTranslationRequest>()
+
+    init() {
+        (signals, signalContinuation) = AsyncStream.makeStream()
+    }
+
+    func submit(_ request: PendingTranslationRequest) {
+        guard request.isActive else { return }
+        let superseded = scheduler.enqueue(request, priority: request.priority)
+        superseded?.cancel()
+        signalContinuation.yield(())
+    }
+
+    func takeNext() -> PendingTranslationRequest? {
+        while let request = scheduler.next() {
+            if request.isActive {
+                return request
+            }
+        }
+        return nil
+    }
+}
+
+@MainActor
+final class LocalTranslationService {
+    private let jaToEnLane = TranslationLane()
+    private let enToJaLane = TranslationLane()
 
     private(set) var isJapaneseToEnglishReady = false
     private(set) var isEnglishToJapaneseReady = false
 
-    init() {
-        (jaToEnStream, jaToEnContinuation) = AsyncStream.makeStream()
-        (enToJaStream, enToJaContinuation) = AsyncStream.makeStream()
-    }
-
-    func translate(_ text: String, from language: SpokenLanguage) async throws -> String {
+    func translate(
+        _ text: String,
+        from language: SpokenLanguage,
+        priority: LocalTranslationPriority
+    ) async throws -> String {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return "" }
 
-        return try await withCheckedThrowingContinuation { continuation in
-            let request = PendingRequest(text: trimmed, continuation: continuation)
-            switch language {
-            case .japanese:
-                jaToEnContinuation.yield(request)
-            case .english:
-                enToJaContinuation.yield(request)
-            case .unknown:
-                continuation.resume(throwing: LocalTranslationError.sessionUnavailable)
+        let request = PendingTranslationRequest(text: trimmed, priority: priority)
+        let lane: TranslationLane
+        switch language {
+        case .japanese:
+            lane = jaToEnLane
+        case .english:
+            lane = enToJaLane
+        case .unknown:
+            throw LocalTranslationError.sessionUnavailable
+        }
+
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                guard request.install(continuation) else { return }
+                lane.submit(request)
             }
+        } onCancel: {
+            request.cancel()
         }
     }
 
     func runJapaneseToEnglish(session: TranslationSession) async {
         await run(
             session: session,
-            stream: jaToEnStream,
+            lane: jaToEnLane,
             markReady: { self.isJapaneseToEnglishReady = $0 }
         )
     }
@@ -61,14 +187,14 @@ final class LocalTranslationService {
     func runEnglishToJapanese(session: TranslationSession) async {
         await run(
             session: session,
-            stream: enToJaStream,
+            lane: enToJaLane,
             markReady: { self.isEnglishToJapaneseReady = $0 }
         )
     }
 
     private func run(
         session: TranslationSession,
-        stream: AsyncStream<PendingRequest>,
+        lane: TranslationLane,
         markReady: @escaping (Bool) -> Void
     ) async {
         var preparationError: Error?
@@ -83,17 +209,19 @@ final class LocalTranslationService {
             )
         }
 
-        for await request in stream {
-            if let preparationError {
-                request.continuation.resume(throwing: preparationError)
-                continue
-            }
+        for await _ in lane.signals {
+            while let request = lane.takeNext() {
+                if let preparationError {
+                    request.complete(with: .failure(preparationError))
+                    continue
+                }
 
-            do {
-                let response = try await session.translate(request.text)
-                request.continuation.resume(returning: response.targetText)
-            } catch {
-                request.continuation.resume(throwing: error)
+                do {
+                    let response = try await session.translate(request.text)
+                    request.complete(with: .success(response.targetText))
+                } catch {
+                    request.complete(with: .failure(error))
+                }
             }
         }
     }

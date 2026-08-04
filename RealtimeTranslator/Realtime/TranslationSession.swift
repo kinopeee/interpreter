@@ -177,14 +177,15 @@ final class InterpretationSession {
         translationTask = Task { @MainActor [weak self] in
             guard let self else { return }
             if !isFinal {
-                try? await Task.sleep(nanoseconds: 450_000_000)
+                try? await Task.sleep(nanoseconds: 300_000_000)
                 guard !Task.isCancelled else { return }
             }
 
             do {
                 let translated = try await self.translationService.translate(
                     text,
-                    from: language
+                    from: language,
+                    priority: isFinal ? .final : .live
                 )
                 guard !Task.isCancelled, generation == self.translationGeneration else {
                     return
