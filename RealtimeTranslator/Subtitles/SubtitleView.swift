@@ -4,6 +4,7 @@ enum SubtitleTextLayout {
     static let currentLineLimit = 2
     static let previousLineLimit = 1
     static let previousFontScale = 0.82
+    static let truncationMode: Text.TruncationMode = .head
 }
 
 enum SubtitleVisualStyle {
@@ -98,7 +99,7 @@ struct SubtitleView: View {
                     )
                     .foregroundStyle(Color.white.opacity(0.94))
                     .lineLimit(lineLimit)
-                    .truncationMode(.tail)
+                    .truncationMode(SubtitleTextLayout.truncationMode)
                     .fixedSize(horizontal: false, vertical: true)
                     .subtitleHalo()
             }
@@ -106,7 +107,7 @@ struct SubtitleView: View {
                 .font(.system(size: fontSize * fontScale, weight: .semibold))
                 .foregroundStyle(.white)
                 .lineLimit(lineLimit)
-                .truncationMode(.tail)
+                .truncationMode(SubtitleTextLayout.truncationMode)
                 .fixedSize(horizontal: false, vertical: true)
                 .subtitleHalo()
                 .opacity(SubtitleVisualStyle.translatedTextOpacity(for: subtitle))

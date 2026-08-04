@@ -129,16 +129,18 @@ final class SubtitlePresentationTests: XCTestCase {
         XCTAssertEqual(opacity, 1)
     }
 
-    func testTextLayoutUsesCompactCurrentAndPreviousLimits() {
-        // Given: 現在文と前文を同時に表示する字幕
-        // When: 各ブロックの最大行数設定を確認する
+    func testTextLayoutUsesCompactLimitsAndKeepsSentenceEnd() {
+        // Given: 行数を超える現在文と前文を同時に表示する字幕
+        // When: 各ブロックの最大行数と省略位置の設定を確認する
         let currentLineLimit = SubtitleTextLayout.currentLineLimit
         let previousLineLimit = SubtitleTextLayout.previousLineLimit
+        let truncationMode = SubtitleTextLayout.truncationMode
 
-        // Then: 現在文を2行、補助的な前文を1行に抑える
+        // Then: 行数を抑えつつ文頭を省略し、必要な文末を残す
         XCTAssertEqual(currentLineLimit, 2)
         XCTAssertEqual(previousLineLimit, 1)
         XCTAssertLessThan(SubtitleTextLayout.previousFontScale, 1)
+        XCTAssertEqual(truncationMode, .head)
     }
 
     func testLongTranslationHeightIsBoundedByLineLimit() {
