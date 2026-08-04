@@ -36,6 +36,59 @@ final class InterpretationSession {
         let isFinal: Bool
     }
 
+    private struct CurrentUtterance {
+        private(set) var generation = 0
+        private(set) var sourceText = ""
+        private(set) var translatedText = ""
+        private(set) var language: SpokenLanguage = .unknown
+
+        mutating func reset() {
+            self = CurrentUtterance()
+        }
+
+        @discardableResult
+        mutating func updateSource(
+            _ sourceText: String,
+            language: SpokenLanguage
+        ) -> Int {
+            generation += 1
+            let preservesTranslation = language == self.language
+                && !translatedText.isEmpty
+                && !self.sourceText.isEmpty
+            if !preservesTranslation {
+                translatedText = ""
+            }
+            self.sourceText = sourceText
+            self.language = language
+            return generation
+        }
+
+        mutating func retract() {
+            generation += 1
+            clearContent()
+        }
+
+        mutating func clearContent() {
+            sourceText = ""
+            translatedText = ""
+            language = .unknown
+        }
+
+        mutating func applyTranslation(
+            _ translatedText: String,
+            generation: Int,
+            sourceText: String
+        ) -> Bool {
+            guard generation == self.generation,
+                  sourceText == self.sourceText
+            else {
+                return false
+            }
+            self.translatedText = translatedText
+            return true
+        }
+    }
+
     private struct FinalTranslationRequest {
         let sourceText: String
         let language: SpokenLanguage
@@ -71,10 +124,7 @@ final class InterpretationSession {
     private var pendingTranscription: PendingTranscription?
     private var lastTranscriptionRenderedAt = Date.distantPast
     private var lifecycleGeneration = 0
-    private var sourceGeneration = 0
-    private var currentSourceText = ""
-    private var currentTranslationText = ""
-    private var currentLanguage: SpokenLanguage = .unknown
+    private var currentUtterance = CurrentUtterance()
 
     init(
         translationService: any LocalTranslationServicing,
@@ -103,10 +153,7 @@ final class InterpretationSession {
         transcriptionRenderTask?.cancel()
         transcriptionRenderTask = nil
         pendingTranscription = nil
-        currentSourceText = ""
-        currentTranslationText = ""
-        currentLanguage = .unknown
-        sourceGeneration = 0
+        currentUtterance.reset()
         liveTranslationTask?.cancel()
         liveTranslationTask = nil
         finalTranslationQueue.removeAll()
@@ -223,7 +270,7 @@ final class InterpretationSession {
 
     private func retractTranscription(language: SpokenLanguage) {
         let retractsPending = pendingTranscription?.language == language
-        let retractsCurrent = currentLanguage == language
+        let retractsCurrent = currentUtterance.language == language
         guard retractsPending || retractsCurrent else { return }
 
         if retractsPending {
@@ -233,51 +280,27 @@ final class InterpretationSession {
         }
         guard retractsCurrent else { return }
 
-        sourceGeneration += 1
         liveTranslationTask?.cancel()
         liveTranslationTask = nil
-        currentSourceText = ""
-        currentTranslationText = ""
-        currentLanguage = .unknown
-        let snapshot = aggregator.replaceCurrent(
-            sourceText: "",
-            translatedText: "",
-            isTranslationCurrent: false,
-            canFinalize: false
-        )
-        delegate?.interpretationSession(self, didUpdateSubtitles: snapshot)
+        currentUtterance.retract()
+        publishCurrentUtterance(isTranslationCurrent: false)
     }
 
     private func renderTranscription(_ transcription: PendingTranscription) {
         let text = transcription.text
         let language = transcription.language
         let isFinal = transcription.isFinal
-        guard text != currentSourceText || isFinal else { return }
+        guard text != currentUtterance.sourceText || isFinal else { return }
         lastTranscriptionRenderedAt = Date()
 
-        sourceGeneration += 1
-        let generation = sourceGeneration
-        let preservesTranslation = language == currentLanguage
-            && !currentTranslationText.isEmpty
-            && !currentSourceText.isEmpty
-        if !preservesTranslation {
-            currentTranslationText = ""
-        }
-        currentSourceText = text
-        currentLanguage = language
+        let generation = currentUtterance.updateSource(text, language: language)
         liveTranslationTask?.cancel()
         liveTranslationTask = nil
 
         if state == .listening {
             aggregator.setStatusBanner(nil)
         }
-        let sourceSnapshot = aggregator.replaceCurrent(
-            sourceText: text,
-            translatedText: currentTranslationText,
-            isTranslationCurrent: false,
-            canFinalize: false
-        )
-        delegate?.interpretationSession(self, didUpdateSubtitles: sourceSnapshot)
+        publishCurrentUtterance(isTranslationCurrent: false)
 
         if isFinal {
             enqueueFinalTranslation(
@@ -300,27 +323,20 @@ final class InterpretationSession {
                     priority: .live
                 )
                 guard !Task.isCancelled,
-                      generation == self.sourceGeneration,
-                      self.currentSourceText == text
+                      self.currentUtterance.applyTranslation(
+                          translated,
+                          generation: generation,
+                          sourceText: text
+                      )
                 else {
                     return
                 }
 
-                self.currentTranslationText = translated
-                let snapshot = self.aggregator.replaceCurrent(
-                    sourceText: self.currentSourceText,
-                    translatedText: translated,
-                    isTranslationCurrent: true,
-                    canFinalize: false
-                )
-                self.delegate?.interpretationSession(
-                    self,
-                    didUpdateSubtitles: snapshot
-                )
+                self.publishCurrentUtterance(isTranslationCurrent: true)
             } catch is CancellationError {
                 return
             } catch {
-                guard generation == self.sourceGeneration else { return }
+                guard generation == self.currentUtterance.generation else { return }
                 self.aggregator.setStatusBanner("ローカル翻訳を準備中…")
                 self.publishSubtitles()
                 AppLogger.general.error(
@@ -368,11 +384,10 @@ final class InterpretationSession {
                     from: request.language,
                     priority: .final
                 )
-                let clearsCurrent = request.sourceGeneration == sourceGeneration
+                let clearsCurrent =
+                    request.sourceGeneration == currentUtterance.generation
                 if clearsCurrent {
-                    currentSourceText = ""
-                    currentTranslationText = ""
-                    currentLanguage = .unknown
+                    currentUtterance.clearContent()
                 }
                 let finalized = aggregator.finalizePair(
                     sourceText: request.sourceText,
@@ -422,6 +437,16 @@ final class InterpretationSession {
     private func stopTicker() {
         tickerTask?.cancel()
         tickerTask = nil
+    }
+
+    private func publishCurrentUtterance(isTranslationCurrent: Bool) {
+        let snapshot = aggregator.replaceCurrent(
+            sourceText: currentUtterance.sourceText,
+            translatedText: currentUtterance.translatedText,
+            isTranslationCurrent: isTranslationCurrent,
+            canFinalize: false
+        )
+        delegate?.interpretationSession(self, didUpdateSubtitles: snapshot)
     }
 
     private func publishSubtitles() {

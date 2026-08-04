@@ -203,6 +203,106 @@ final class InterpretationSessionTests: XCTestCase {
         await session.stop()
     }
 
+    func testSameLanguageUpdateKeepsPreviousTranslationAsStale() async throws {
+        // Given: 日本語の暫定原文と対応するlive訳文を表示中のセッション
+        let speechService = FakeSpeechRecognitionService()
+        let translationService = FakeTranslationService()
+        translationService.translations["最初の認識"] = "Initial recognition"
+        let delegate = InterpretationSessionDelegateSpy()
+        let session = InterpretationSession(
+            translationService: translationService,
+            speechService: speechService
+        )
+        session.delegate = delegate
+        await session.start()
+        speechService.emit(
+            text: "最初の認識",
+            language: .japanese,
+            isFinal: false
+        )
+        await delegate.waitUntilCurrentTranslation("Initial recognition")
+
+        // When: 同じ認識レーンの原文が続きまで更新される
+        speechService.emit(
+            text: "最初の認識の続き",
+            language: .japanese,
+            isFinal: false
+        )
+        await delegate.waitUntilCurrentSource("最初の認識の続き")
+
+        // Then: 旧訳文を参考表示しつつ、現在訳や確定可能とは扱わない
+        let current = try XCTUnwrap(delegate.lastSnapshot?.current)
+        XCTAssertEqual(current.sourceText, "最初の認識の続き")
+        XCTAssertEqual(current.translatedText, "Initial recognition")
+        XCTAssertFalse(current.isTranslationCurrent)
+        XCTAssertFalse(current.canFinalize)
+        await session.stop()
+    }
+
+    func testLanguageChangeClearsPreviousTranslation() async throws {
+        // Given: 日本語原文のlive訳文を表示中のセッション
+        let speechService = FakeSpeechRecognitionService()
+        let translationService = FakeTranslationService()
+        translationService.translations["日本語です"] = "This is Japanese"
+        let delegate = InterpretationSessionDelegateSpy()
+        let session = InterpretationSession(
+            translationService: translationService,
+            speechService: speechService
+        )
+        session.delegate = delegate
+        await session.start()
+        speechService.emit(text: "日本語です", language: .japanese, isFinal: false)
+        await delegate.waitUntilCurrentTranslation("This is Japanese")
+
+        // When: 英語レーンの新しい原文へ切り替わる
+        speechService.emit(text: "Now English", language: .english, isFinal: false)
+        await delegate.waitUntilCurrentSource("Now English")
+
+        // Then: 異なる言語の旧訳文を新しい原文へ引き継がない
+        let current = try XCTUnwrap(delegate.lastSnapshot?.current)
+        XCTAssertEqual(current.sourceText, "Now English")
+        XCTAssertTrue(current.translatedText.isEmpty)
+        XCTAssertFalse(current.isTranslationCurrent)
+        XCTAssertFalse(current.canFinalize)
+        await session.stop()
+    }
+
+    func testStaleLiveTranslationDoesNotOverwriteNewerUtterance() async throws {
+        // Given: 文Aのlive翻訳を完了待ちにしているセッション
+        let speechService = FakeSpeechRecognitionService()
+        let translationService = FakeTranslationService()
+        translationService.translations["文A"] = "Sentence A"
+        translationService.translations["文B"] = "Sentence B"
+        translationService.suspendedLiveTexts.insert("文A")
+        let delegate = InterpretationSessionDelegateSpy()
+        let session = InterpretationSession(
+            translationService: translationService,
+            speechService: speechService
+        )
+        session.delegate = delegate
+        await session.start()
+        speechService.emit(text: "文A", language: .japanese, isFinal: false)
+        await translationService.waitUntilLiveRequested("文A")
+
+        // When: 原文を文Bへ更新した後で、古い文Aの翻訳を完了する
+        speechService.emit(text: "文B", language: .japanese, isFinal: false)
+        await delegate.waitUntilCurrentSource("文B")
+        translationService.completeLive("文A")
+        await delegate.waitUntilCurrentTranslation("Sentence B")
+
+        // Then: 文Bの表示履歴へ文Aの古い訳文を一度も反映しない
+        let current = try XCTUnwrap(delegate.lastSnapshot?.current)
+        XCTAssertEqual(current.sourceText, "文B")
+        XCTAssertEqual(current.translatedText, "Sentence B")
+        XCTAssertFalse(
+            delegate.snapshots.contains {
+                $0.current.sourceText == "文B"
+                    && $0.current.translatedText == "Sentence A"
+            }
+        )
+        await session.stop()
+    }
+
     func testFinalTranslationQueueRejectsNewestBeyondCapacity() async {
         // Given: 実行中の文Aと、1件だけ待機可能な確定翻訳キュー
         let speechService = FakeSpeechRecognitionService()
@@ -433,11 +533,14 @@ private final class FakeSpeechRecognitionService: LocalSpeechRecognitionServicin
 @MainActor
 private final class FakeTranslationService: LocalTranslationServicing {
     var translations: [String: String] = [:]
+    var suspendedLiveTexts: Set<String> = []
     var suspendedFinalTexts: Set<String> = []
     var cancelledFinalTexts: Set<String> = []
     private(set) var finalRequests: [String] = []
     private(set) var liveRequests: [String] = []
+    private var liveContinuations: [String: CheckedContinuation<String, Error>] = [:]
     private var finalContinuations: [String: CheckedContinuation<String, Error>] = [:]
+    private var liveRequestWaiters: [String: [CheckedContinuation<Void, Never>]] = [:]
     private var finalRequestWaiters: [String: [CheckedContinuation<Void, Never>]] = [:]
 
     func translate(
@@ -448,6 +551,15 @@ private final class FakeTranslationService: LocalTranslationServicing {
         switch priority {
         case .live:
             liveRequests.append(text)
+            let waiters = liveRequestWaiters.removeValue(forKey: text) ?? []
+            for waiter in waiters {
+                waiter.resume()
+            }
+            if suspendedLiveTexts.contains(text) {
+                return try await withCheckedThrowingContinuation { continuation in
+                    liveContinuations[text] = continuation
+                }
+            }
             return translations[text] ?? "Translated: \(text)"
         case .final:
             finalRequests.append(text)
@@ -465,6 +577,18 @@ private final class FakeTranslationService: LocalTranslationServicing {
             }
             return translations[text] ?? "Translated: \(text)"
         }
+    }
+
+    func waitUntilLiveRequested(_ text: String) async {
+        guard !liveRequests.contains(text) else { return }
+        await withCheckedContinuation { continuation in
+            liveRequestWaiters[text, default: []].append(continuation)
+        }
+    }
+
+    func completeLive(_ text: String) {
+        let continuation = liveContinuations.removeValue(forKey: text)
+        continuation?.resume(returning: translations[text] ?? "Translated: \(text)")
     }
 
     func waitUntilFinalRequested(_ text: String) async {
@@ -486,6 +610,7 @@ private final class InterpretationSessionDelegateSpy: InterpretationSessionDeleg
     private(set) var snapshots: [SubtitleSnapshot] = []
     private(set) var messages: [String] = []
     private var currentSourceWaiters: [String: [CheckedContinuation<Void, Never>]] = [:]
+    private var currentTranslationWaiters: [String: [CheckedContinuation<Void, Never>]] = [:]
     private var previousSourceWaiters: [String: [CheckedContinuation<Void, Never>]] = [:]
     private var messageWaiters: [String: [CheckedContinuation<Void, Never>]] = [:]
     private var finalizedSubtitleClearWaiters: [CheckedContinuation<Void, Never>] = []
@@ -499,6 +624,13 @@ private final class InterpretationSessionDelegateSpy: InterpretationSessionDeleg
         guard lastSnapshot?.current.sourceText != sourceText else { return }
         await withCheckedContinuation { continuation in
             currentSourceWaiters[sourceText, default: []].append(continuation)
+        }
+    }
+
+    func waitUntilCurrentTranslation(_ translatedText: String) async {
+        guard lastSnapshot?.current.translatedText != translatedText else { return }
+        await withCheckedContinuation { continuation in
+            currentTranslationWaiters[translatedText, default: []].append(continuation)
         }
     }
 
@@ -547,6 +679,12 @@ private final class InterpretationSessionDelegateSpy: InterpretationSessionDeleg
             forKey: snapshot.current.sourceText
         ) ?? []
         for waiter in currentWaiters {
+            waiter.resume()
+        }
+        let translationWaiters = currentTranslationWaiters.removeValue(
+            forKey: snapshot.current.translatedText
+        ) ?? []
+        for waiter in translationWaiters {
             waiter.resume()
         }
         if let previousSource = snapshot.previous?.sourceText {
