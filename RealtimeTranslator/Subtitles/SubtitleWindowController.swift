@@ -5,7 +5,8 @@ import SwiftUI
 final class SubtitleWindowController: NSObject {
     private let panel: SubtitlePanel
     private let controlPanel: SubtitlePanel
-    private let hostingView: NSHostingView<SubtitleView>
+    private let hostingController: NSHostingController<SubtitleView>
+    private let subtitleContainerView: NSView
     private let controlHostingView: NSHostingView<RecordingControlView>
     private let translationHostingView: NSHostingView<LocalTranslationHostView>
     private let controlContainerView = NSView()
@@ -21,17 +22,25 @@ final class SubtitleWindowController: NSObject {
     private var dragStartMouseLocation: NSPoint?
 
     init(translationService: LocalTranslationService) {
-        let initialFrame = Self.defaultFrame(for: NSScreen.main)
-        panel = SubtitlePanel(contentRect: initialFrame)
-        controlPanel = SubtitlePanel(contentRect: Self.controlFrame(for: initialFrame))
+        let subtitleView = SubtitleView(
+            snapshot: .empty,
+            displayMode: .both,
+            fontSize: 32,
+            isEditingPosition: false
+        )
+        let subtitleHostingController = NSHostingController(rootView: subtitleView)
+        let initialScreen = NSScreen.main ?? NSScreen.screens.first
+        let initialLayout = Self.initialLayout(
+            hostingController: subtitleHostingController,
+            screen: initialScreen
+        )
+
+        panel = SubtitlePanel(contentRect: initialLayout.subtitleFrame)
+        controlPanel = SubtitlePanel(contentRect: initialLayout.controlFrame)
         controlPanel.ignoresMouseEvents = false
-        hostingView = NSHostingView(
-            rootView: SubtitleView(
-                snapshot: .empty,
-                displayMode: .both,
-                fontSize: 32,
-                isEditingPosition: false
-            )
+        hostingController = subtitleHostingController
+        subtitleContainerView = NSView(
+            frame: NSRect(origin: .zero, size: initialLayout.subtitleFrame.size)
         )
         controlHostingView = NSHostingView(
             rootView: RecordingControlView(state: .idle, onToggleRecording: {})
@@ -40,10 +49,12 @@ final class SubtitleWindowController: NSObject {
             rootView: LocalTranslationHostView(service: translationService)
         )
         super.init()
-        hostingView.frame = panel.contentView?.bounds ?? initialFrame
-        hostingView.autoresizingMask = [.width, .height]
-        panel.contentView = hostingView
-        panel.setFrame(initialFrame, display: false)
+        subtitleContainerView.autoresizesSubviews = true
+        hostingController.view.frame = subtitleContainerView.bounds
+        hostingController.view.autoresizingMask = [.width, .height]
+        subtitleContainerView.addSubview(hostingController.view)
+        panel.contentView = subtitleContainerView
+        panel.setFrame(initialLayout.subtitleFrame, display: false)
         panel.orderFrontRegardless()
         controlContainerView.frame = controlPanel.contentView?.bounds ?? .zero
         controlContainerView.autoresizingMask = [.width, .height]
@@ -93,29 +104,31 @@ final class SubtitleWindowController: NSObject {
         fontSize: Double,
         translationState: TranslationState
     ) {
+        let shouldRenderSubtitles = self.snapshot.presentation != snapshot.presentation
+            || self.displayMode != displayMode
+            || self.fontSize != fontSize
+        let shouldRenderControls = self.translationState != translationState
         self.snapshot = snapshot
         self.displayMode = displayMode
         self.fontSize = fontSize
         self.translationState = translationState
-        render()
-        relayoutIfNeeded()
+        if shouldRenderSubtitles {
+            renderSubtitles()
+            relayoutIfNeeded()
+        }
+        if shouldRenderControls {
+            renderControls()
+        }
     }
 
     func setRecordingHandler(_ handler: @escaping () -> Void) {
         onToggleRecording = handler
-        render()
+        renderControls()
     }
 
     func applySavedOrigin(_ origin: CGPoint?) {
         customOrigin = origin
-        if let origin {
-            var frame = panel.frame
-            frame.origin = origin
-            panel.setFrame(frame, display: true)
-            layoutControlPanel(relativeTo: frame)
-        } else {
-            relayoutIfNeeded(forceDefault: true)
-        }
+        relayoutIfNeeded(forceDefault: origin == nil)
     }
 
     func setPositionEditingEnabled(_ enabled: Bool) {
@@ -127,7 +140,7 @@ final class SubtitleWindowController: NSObject {
         } else {
             removeDragMonitor()
         }
-        render()
+        renderSubtitles()
     }
 
     var currentOrigin: CGPoint {
@@ -165,11 +178,9 @@ final class SubtitleWindowController: NSObject {
             else { return }
             let current = NSEvent.mouseLocation
             let delta = NSPoint(x: current.x - startMouse.x, y: current.y - startMouse.y)
-            var frame = panel.frame
-            frame.origin = NSPoint(x: startOrigin.x + delta.x, y: startOrigin.y + delta.y)
-            panel.setFrame(frame, display: true)
-            customOrigin = frame.origin
-            layoutControlPanel(relativeTo: frame)
+            movePanels(
+                to: NSPoint(x: startOrigin.x + delta.x, y: startOrigin.y + delta.y)
+            )
         case .leftMouseUp:
             customOrigin = panel.frame.origin
             dragStartPanelOrigin = nil
@@ -179,13 +190,16 @@ final class SubtitleWindowController: NSObject {
         }
     }
 
-    private func render() {
-        hostingView.rootView = SubtitleView(
+    private func renderSubtitles() {
+        hostingController.rootView = SubtitleView(
             snapshot: snapshot,
             displayMode: displayMode,
             fontSize: fontSize,
             isEditingPosition: isEditingPosition
         )
+    }
+
+    private func renderControls() {
         controlHostingView.rootView = RecordingControlView(
             state: translationState,
             onToggleRecording: onToggleRecording
@@ -193,48 +207,122 @@ final class SubtitleWindowController: NSObject {
     }
 
     private func relayoutIfNeeded(forceDefault: Bool = false) {
-        let target = Self.defaultFrame(for: NSScreen.main)
-        var frame = panel.frame
-        frame.size = target.size
-
-        if forceDefault || customOrigin == nil {
-            frame.origin = target.origin
-        } else if let customOrigin {
-            frame.origin = customOrigin
-        }
-
-        // Keep panel on the visible screen.
-        if let screen = NSScreen.main {
-            let visible = screen.visibleFrame
-            frame.origin.x = min(max(frame.origin.x, visible.minX), visible.maxX - frame.width)
-            frame.origin.y = min(max(frame.origin.y, visible.minY), visible.maxY - frame.height)
-        }
-        panel.setFrame(frame, display: true)
-        layoutControlPanel(relativeTo: frame)
+        let requestedOrigin = forceDefault ? nil : customOrigin
+        guard let screen = targetScreen(containing: requestedOrigin) else { return }
+        apply(layout(in: screen, requestedOrigin: requestedOrigin))
     }
 
-    private func layoutControlPanel(relativeTo subtitleFrame: NSRect) {
-        controlPanel.setFrame(Self.controlFrame(for: subtitleFrame), display: true)
+    private func movePanels(to requestedOrigin: CGPoint) {
+        guard let screen = targetScreen(
+            bestMatchingSubtitleOrigin: requestedOrigin
+        ) else {
+            return
+        }
+        let layout = layout(in: screen, requestedOrigin: requestedOrigin)
+        apply(layout)
+        customOrigin = layout.subtitleFrame.origin
     }
 
-    private static func controlFrame(for subtitleFrame: NSRect) -> NSRect {
-        let size = NSSize(width: 160, height: 48)
-        return NSRect(
-            x: subtitleFrame.midX - size.width / 2,
-            y: subtitleFrame.maxY + 8,
-            width: size.width,
-            height: size.height
+    private func targetScreen(containing origin: CGPoint?) -> NSScreen? {
+        let screens = NSScreen.screens
+        guard !screens.isEmpty else { return nil }
+
+        let fallbackScreen = NSScreen.main ?? screens.first
+        guard let origin else { return fallbackScreen }
+
+        let fallbackIndex = fallbackScreen.flatMap { fallback in
+            screens.firstIndex { $0 === fallback }
+        }
+        guard let index = SubtitleWindowGeometry.screenIndex(
+            containing: origin,
+            in: screens.map(\.frame),
+            fallbackIndex: fallbackIndex
+        ) else {
+            return fallbackScreen
+        }
+        return screens[index]
+    }
+
+    private func targetScreen(
+        bestMatchingSubtitleOrigin origin: CGPoint
+    ) -> NSScreen? {
+        let screens = NSScreen.screens
+        guard !screens.isEmpty else { return nil }
+
+        let fallbackScreen = panel.screen ?? NSScreen.main ?? screens.first
+        let fallbackIndex = fallbackScreen.flatMap { fallback in
+            screens.firstIndex { $0 === fallback }
+        }
+        guard let index = SubtitleWindowGeometry.screenIndex(
+            bestMatching: CGRect(origin: origin, size: panel.frame.size),
+            in: screens.map(\.frame),
+            fallbackIndex: fallbackIndex
+        ) else {
+            return fallbackScreen
+        }
+        return screens[index]
+    }
+
+    private func layout(
+        in screen: NSScreen,
+        requestedOrigin: CGPoint?
+    ) -> SubtitleWindowLayout {
+        let visibleFrame = screen.visibleFrame
+        let subtitleSize = Self.subtitleSize(
+            hostingController: hostingController,
+            in: visibleFrame
+        )
+        let origin = requestedOrigin ?? SubtitleWindowGeometry.defaultOrigin(
+            in: visibleFrame,
+            subtitleSize: subtitleSize
+        )
+        return SubtitleWindowGeometry.layout(
+            subtitleOrigin: origin,
+            subtitleSize: subtitleSize,
+            in: visibleFrame
         )
     }
 
-    private static func defaultFrame(for screen: NSScreen?) -> NSRect {
-        let screenFrame = screen?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
-        let width = min(screenFrame.width * 0.70, 1200)
-        // Two paired subtitle blocks can each wrap to multiple lines. The panel is transparent,
-        // so reserve enough vertical layout space to avoid clipping the current translation.
-        let height: CGFloat = 280
-        let x = screenFrame.midX - width / 2
-        let y = screenFrame.minY + 48
-        return NSRect(x: x, y: y, width: width, height: height)
+    private func apply(_ layout: SubtitleWindowLayout) {
+        panel.setFrame(layout.subtitleFrame, display: true)
+        controlPanel.setFrame(layout.controlFrame, display: true)
+    }
+
+    private static func initialLayout(
+        hostingController: NSHostingController<SubtitleView>,
+        screen: NSScreen?
+    ) -> SubtitleWindowLayout {
+        let visibleFrame = screen?.visibleFrame ?? .zero
+        let subtitleSize = subtitleSize(
+            hostingController: hostingController,
+            in: visibleFrame
+        )
+        let origin = SubtitleWindowGeometry.defaultOrigin(
+            in: visibleFrame,
+            subtitleSize: subtitleSize
+        )
+        return SubtitleWindowGeometry.layout(
+            subtitleOrigin: origin,
+            subtitleSize: subtitleSize,
+            in: visibleFrame
+        )
+    }
+
+    private static func subtitleSize(
+        hostingController: NSHostingController<SubtitleView>,
+        in visibleFrame: CGRect
+    ) -> CGSize {
+        let width = SubtitleWindowGeometry.subtitleWidth(in: visibleFrame)
+        let measuredSize = hostingController.sizeThatFits(
+            in: NSSize(
+                width: width,
+                height: CGFloat.greatestFiniteMagnitude
+            )
+        )
+        let height = SubtitleWindowGeometry.subtitleHeight(
+            measuredContentHeight: measuredSize.height,
+            in: visibleFrame
+        )
+        return CGSize(width: width, height: height)
     }
 }

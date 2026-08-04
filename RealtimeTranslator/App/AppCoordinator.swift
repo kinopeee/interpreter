@@ -163,9 +163,19 @@ extension AppCoordinator: InterpretationSessionDelegate {
         _ session: InterpretationSession,
         didUpdateSubtitles snapshot: SubtitleSnapshot
     ) {
-        lastSnapshot = snapshot
+        let displayedSnapshot: SubtitleSnapshot
+        if translationState == .idle,
+           snapshot.current.isEmpty,
+           snapshot.previous == nil,
+           snapshot.statusBanner == nil
+        {
+            displayedSnapshot = idleSnapshot
+        } else {
+            displayedSnapshot = snapshot
+        }
+        lastSnapshot = displayedSnapshot
         subtitleWindow.update(
-            snapshot: snapshot,
+            snapshot: displayedSnapshot,
             displayMode: .both,
             fontSize: settings.fontSize,
             translationState: translationState

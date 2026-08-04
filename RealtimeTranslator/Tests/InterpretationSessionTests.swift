@@ -149,6 +149,197 @@ final class InterpretationSessionTests: XCTestCase {
         XCTAssertEqual(delegate.lastSnapshot?.previous?.translatedText, "Sentence B")
         await session.stop()
     }
+
+    func testEmptyRecognitionRetractsCurrentWithoutTranslation() async {
+        // Given: 日本語の暫定字幕を表示し、翻訳debounce中のセッション
+        let speechService = FakeSpeechRecognitionService()
+        let translationService = FakeTranslationService()
+        let delegate = InterpretationSessionDelegateSpy()
+        let session = InterpretationSession(
+            translationService: translationService,
+            speechService: speechService
+        )
+        session.delegate = delegate
+        await session.start()
+        speechService.emit(text: "暫定字幕", language: .japanese, isFinal: false)
+        await delegate.waitUntilCurrentSource("暫定字幕")
+
+        // When: 同じ認識レーンから空のvolatile結果が届く
+        speechService.emit(text: "", language: .japanese, isFinal: false)
+
+        // Then: currentを撤回し、空文字を翻訳要求へ送らない
+        XCTAssertTrue(delegate.lastSnapshot?.current.isEmpty == true)
+        XCTAssertTrue(translationService.liveRequests.isEmpty)
+        XCTAssertTrue(translationService.finalRequests.isEmpty)
+        await session.stop()
+    }
+
+    func testEmptyFinalDoesNotBlockFollowingFinalSentence() async {
+        // Given: 日本語の暫定字幕を表示しているセッション
+        let speechService = FakeSpeechRecognitionService()
+        let translationService = FakeTranslationService()
+        translationService.translations["次の文"] = "The next sentence"
+        let delegate = InterpretationSessionDelegateSpy()
+        let session = InterpretationSession(
+            translationService: translationService,
+            speechService: speechService
+        )
+        session.delegate = delegate
+        await session.start()
+        speechService.emit(text: "撤回対象", language: .japanese, isFinal: false)
+        await delegate.waitUntilCurrentSource("撤回対象")
+
+        // When: 空finalで撤回した後、次の確定文が届く
+        speechService.emit(text: "", language: .japanese, isFinal: true)
+        speechService.emit(text: "次の文", language: .japanese, isFinal: true)
+        await delegate.waitUntilPreviousSource("次の文")
+
+        // Then: 空文字をキューへ入れず、次の文だけを翻訳する
+        XCTAssertEqual(translationService.finalRequests, ["次の文"])
+        XCTAssertEqual(
+            delegate.lastSnapshot?.previous?.translatedText,
+            "The next sentence"
+        )
+        await session.stop()
+    }
+
+    func testFinalTranslationQueueRejectsNewestBeyondCapacity() async {
+        // Given: 実行中の文Aと、1件だけ待機可能な確定翻訳キュー
+        let speechService = FakeSpeechRecognitionService()
+        let translationService = FakeTranslationService()
+        translationService.suspendedFinalTexts.insert("文A")
+        translationService.translations["文A"] = "Sentence A"
+        translationService.translations["文B"] = "Sentence B"
+        let delegate = InterpretationSessionDelegateSpy()
+        let session = InterpretationSession(
+            translationService: translationService,
+            speechService: speechService,
+            maxPendingFinalTranslations: 1
+        )
+        session.delegate = delegate
+        await session.start()
+        speechService.emit(text: "文A", language: .japanese, isFinal: true)
+        await translationService.waitUntilFinalRequested("文A")
+
+        // When: 待機文Bと上限超過の文Cを続けて投入する
+        speechService.emit(text: "文B", language: .japanese, isFinal: true)
+        speechService.emit(text: "文C", language: .japanese, isFinal: true)
+        translationService.completeFinal("文A")
+        await translationService.waitUntilFinalRequested("文B")
+        await delegate.waitUntilPreviousSource("文B")
+
+        // Then: 文Cを保持せず、上限メッセージとA・Bだけを処理する
+        XCTAssertEqual(translationService.finalRequests, ["文A", "文B"])
+        XCTAssertTrue(
+            delegate.snapshots.contains {
+                $0.statusBanner == "確定翻訳の待機件数が上限に達しました"
+            }
+        )
+        await session.stop()
+    }
+
+    func testFinalSubtitleExpiresAfterStop() async {
+        // Given: 停止後の保持・fade時間を即時化した字幕集約器
+        var config = SubtitleAggregatorConfig()
+        config.previousHoldInterval = 0.01
+        config.fadeDuration = 0
+        let speechService = FakeSpeechRecognitionService()
+        let translationService = FakeTranslationService()
+        translationService.translations["完了文"] = "Completed sentence"
+        let delegate = InterpretationSessionDelegateSpy()
+        let session = InterpretationSession(
+            translationService: translationService,
+            speechService: speechService,
+            aggregator: SubtitleAggregator(config: config),
+            activeTickerIntervalNanoseconds: 10_000_000_000,
+            idleTickerIntervalNanoseconds: 1_000_000
+        )
+        session.delegate = delegate
+        await session.start()
+        speechService.emit(text: "完了文", language: .japanese, isFinal: true)
+        await delegate.waitUntilPreviousSource("完了文")
+
+        // When: 録音を停止し、idle中の消去tickを待つ
+        await session.stop()
+        await delegate.waitUntilFinalizedSubtitleClears()
+
+        // Then: 最終字幕を無期限保持せず、空のsnapshotへ遷移する
+        XCTAssertEqual(session.state, .idle)
+        XCTAssertTrue(delegate.lastSnapshot?.current.isEmpty == true)
+        XCTAssertNil(delegate.lastSnapshot?.previous)
+    }
+
+    func testSpeechFailureNotifiesOnlyAfterStopCompletes() async {
+        // Given: 音声停止を明示再開まで保留する録音セッション
+        let speechService = FakeSpeechRecognitionService()
+        speechService.suspendsStop = true
+        let translationService = FakeTranslationService()
+        let delegate = InterpretationSessionDelegateSpy()
+        let session = InterpretationSession(
+            translationService: translationService,
+            speechService: speechService
+        )
+        session.delegate = delegate
+        await session.start()
+
+        // When: 音声エラーを通知し、停止処理が待機状態へ入る
+        speechService.emitFailure(LocalSpeechRecognitionError.audioFormatUnavailable)
+        await speechService.waitUntilStopCalled()
+
+        // Then: 停止中はユーザー通知を出さず、停止後に型付きメッセージを1回だけ出す
+        XCTAssertEqual(session.state, .closing)
+        XCTAssertTrue(delegate.messages.isEmpty)
+        speechService.resumeStop()
+        await delegate.waitUntilMessage(
+            "音声認識用の音声形式を取得できません"
+        )
+        XCTAssertEqual(session.state, .error)
+        XCTAssertEqual(
+            Array(delegate.states.suffix(3)),
+            [.closing, .idle, .error]
+        )
+        XCTAssertEqual(
+            delegate.messages,
+            ["音声認識用の音声形式を取得できません"]
+        )
+    }
+
+    func testSpeechFailureStopsTickerAfterFinalSubtitleClears() async {
+        // Given: 確定字幕を表示中で、停止後だけ短い間隔で消去するセッション
+        var config = SubtitleAggregatorConfig()
+        config.previousHoldInterval = 0.01
+        config.fadeDuration = 0
+        let speechService = FakeSpeechRecognitionService()
+        let translationService = FakeTranslationService()
+        translationService.translations["障害前の文"] = "Sentence before failure"
+        let delegate = InterpretationSessionDelegateSpy()
+        let session = InterpretationSession(
+            translationService: translationService,
+            speechService: speechService,
+            aggregator: SubtitleAggregator(config: config),
+            activeTickerIntervalNanoseconds: 10_000_000_000,
+            idleTickerIntervalNanoseconds: 1_000_000
+        )
+        session.delegate = delegate
+        await session.start()
+        speechService.emit(
+            text: "障害前の文",
+            language: .japanese,
+            isFinal: true
+        )
+        await delegate.waitUntilPreviousSource("障害前の文")
+
+        // When: 音声障害でstop後にerrorへ遷移し、字幕が消える
+        speechService.emitFailure(LocalSpeechRecognitionError.audioFormatUnavailable)
+        await delegate.waitUntilMessage(
+            "音声認識用の音声形式を取得できません"
+        )
+        await delegate.waitUntilFinalizedSubtitleClears()
+
+        // Then: error状態でもidle用tickerを保持し続けない
+        XCTAssertEqual(session.state, .error)
+        XCTAssertFalse(session.isTickerRunning)
+    }
 }
 
 @MainActor
@@ -212,6 +403,10 @@ private final class FakeSpeechRecognitionService: LocalSpeechRecognitionServicin
             language: language,
             isFinal: isFinal
         )
+    }
+
+    func emitFailure(_ error: Error) {
+        delegate?.localSpeechRecognitionService(didFail: error)
     }
 
     func waitUntilStartCalled() async {
@@ -292,6 +487,9 @@ private final class InterpretationSessionDelegateSpy: InterpretationSessionDeleg
     private(set) var messages: [String] = []
     private var currentSourceWaiters: [String: [CheckedContinuation<Void, Never>]] = [:]
     private var previousSourceWaiters: [String: [CheckedContinuation<Void, Never>]] = [:]
+    private var messageWaiters: [String: [CheckedContinuation<Void, Never>]] = [:]
+    private var finalizedSubtitleClearWaiters: [CheckedContinuation<Void, Never>] = []
+    private var hasSeenFinalizedSubtitle = false
 
     var lastSnapshot: SubtitleSnapshot? {
         snapshots.last
@@ -311,6 +509,25 @@ private final class InterpretationSessionDelegateSpy: InterpretationSessionDeleg
         }
     }
 
+    func waitUntilMessage(_ message: String) async {
+        guard !messages.contains(message) else { return }
+        await withCheckedContinuation { continuation in
+            messageWaiters[message, default: []].append(continuation)
+        }
+    }
+
+    func waitUntilFinalizedSubtitleClears() async {
+        if hasSeenFinalizedSubtitle,
+           lastSnapshot?.current.isEmpty == true,
+           lastSnapshot?.previous == nil
+        {
+            return
+        }
+        await withCheckedContinuation { continuation in
+            finalizedSubtitleClearWaiters.append(continuation)
+        }
+    }
+
     func interpretationSession(
         _ session: InterpretationSession,
         didUpdateState state: TranslationState
@@ -323,6 +540,9 @@ private final class InterpretationSessionDelegateSpy: InterpretationSessionDeleg
         didUpdateSubtitles snapshot: SubtitleSnapshot
     ) {
         snapshots.append(snapshot)
+        if snapshot.previous != nil {
+            hasSeenFinalizedSubtitle = true
+        }
         let currentWaiters = currentSourceWaiters.removeValue(
             forKey: snapshot.current.sourceText
         ) ?? []
@@ -337,6 +557,16 @@ private final class InterpretationSessionDelegateSpy: InterpretationSessionDeleg
                 waiter.resume()
             }
         }
+        if hasSeenFinalizedSubtitle,
+           snapshot.current.isEmpty,
+           snapshot.previous == nil
+        {
+            let clearWaiters = finalizedSubtitleClearWaiters
+            finalizedSubtitleClearWaiters.removeAll()
+            for waiter in clearWaiters {
+                waiter.resume()
+            }
+        }
     }
 
     func interpretationSession(
@@ -344,6 +574,10 @@ private final class InterpretationSessionDelegateSpy: InterpretationSessionDeleg
         didEncounterMessage message: String
     ) {
         messages.append(message)
+        let waiters = messageWaiters.removeValue(forKey: message) ?? []
+        for waiter in waiters {
+            waiter.resume()
+        }
     }
 }
 

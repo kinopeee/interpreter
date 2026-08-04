@@ -46,13 +46,20 @@ final class InterpretationSession {
 
     private let speechService: any LocalSpeechRecognitionServicing
     private let translationService: any LocalTranslationServicing
-    private let aggregator = SubtitleAggregator()
+    private let aggregator: SubtitleAggregator
+    private let maxPendingFinalTranslations: Int
+    private let activeTickerIntervalNanoseconds: UInt64
+    private let idleTickerIntervalNanoseconds: UInt64
 
     private(set) var state: TranslationState = .idle {
         didSet {
             guard oldValue != state else { return }
             delegate?.interpretationSession(self, didUpdateState: state)
         }
+    }
+
+    var isTickerRunning: Bool {
+        tickerTask != nil
     }
 
     private var tickerTask: Task<Void, Never>?
@@ -71,10 +78,19 @@ final class InterpretationSession {
 
     init(
         translationService: any LocalTranslationServicing,
-        speechService: any LocalSpeechRecognitionServicing = LocalSpeechRecognitionService()
+        speechService: any LocalSpeechRecognitionServicing = LocalSpeechRecognitionService(),
+        aggregator: SubtitleAggregator = SubtitleAggregator(),
+        maxPendingFinalTranslations: Int = 32,
+        activeTickerIntervalNanoseconds: UInt64 = 200_000_000,
+        idleTickerIntervalNanoseconds: UInt64 = 200_000_000
     ) {
+        precondition(maxPendingFinalTranslations > 0)
         self.translationService = translationService
         self.speechService = speechService
+        self.aggregator = aggregator
+        self.maxPendingFinalTranslations = maxPendingFinalTranslations
+        self.activeTickerIntervalNanoseconds = activeTickerIntervalNanoseconds
+        self.idleTickerIntervalNanoseconds = idleTickerIntervalNanoseconds
         speechService.delegate = self
     }
 
@@ -105,7 +121,7 @@ final class InterpretationSession {
             }
             state = .listening
             aggregator.setStatusBanner("録音中… 話してください")
-            startTicker()
+            startTicker(intervalNanoseconds: activeTickerIntervalNanoseconds)
             publishSubtitles()
         } catch is CancellationError {
             guard lifecycleGeneration == generation, state == .connecting else { return }
@@ -150,13 +166,17 @@ final class InterpretationSession {
         if let finalTranslationWorker {
             await finalTranslationWorker.value
         }
-        stopTicker()
 
         let snapshot = aggregator.forceFinalize()
         delegate?.interpretationSession(self, didUpdateSubtitles: snapshot)
         aggregator.setStatusBanner(nil)
         state = .idle
         publishSubtitles()
+        if snapshot.previous == nil {
+            stopTicker()
+        } else {
+            startTicker(intervalNanoseconds: idleTickerIntervalNanoseconds)
+        }
     }
 
     private func handleTranscription(
@@ -166,6 +186,10 @@ final class InterpretationSession {
     ) {
         let acceptsTranscription = state == .listening || (state == .closing && isFinal)
         guard acceptsTranscription, language != .unknown else { return }
+        guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            retractTranscription(language: language)
+            return
+        }
         let pending = PendingTranscription(
             text: text,
             language: language,
@@ -195,6 +219,33 @@ final class InterpretationSession {
             self.pendingTranscription = nil
             self.renderTranscription(pending)
         }
+    }
+
+    private func retractTranscription(language: SpokenLanguage) {
+        let retractsPending = pendingTranscription?.language == language
+        let retractsCurrent = currentLanguage == language
+        guard retractsPending || retractsCurrent else { return }
+
+        if retractsPending {
+            transcriptionRenderTask?.cancel()
+            transcriptionRenderTask = nil
+            pendingTranscription = nil
+        }
+        guard retractsCurrent else { return }
+
+        sourceGeneration += 1
+        liveTranslationTask?.cancel()
+        liveTranslationTask = nil
+        currentSourceText = ""
+        currentTranslationText = ""
+        currentLanguage = .unknown
+        let snapshot = aggregator.replaceCurrent(
+            sourceText: "",
+            translatedText: "",
+            isTranslationCurrent: false,
+            canFinalize: false
+        )
+        delegate?.interpretationSession(self, didUpdateSubtitles: snapshot)
     }
 
     private func renderTranscription(_ transcription: PendingTranscription) {
@@ -284,6 +335,14 @@ final class InterpretationSession {
         language: SpokenLanguage,
         sourceGeneration: Int
     ) {
+        guard finalTranslationQueue.count < maxPendingFinalTranslations else {
+            aggregator.setStatusBanner("確定翻訳の待機件数が上限に達しました")
+            publishSubtitles()
+            AppLogger.general.error(
+                "Final translation queue is full; dropping newest finalized sentence"
+            )
+            return
+        }
         finalTranslationQueue.append(
             FinalTranslationRequest(
                 sourceText: sourceText,
@@ -340,14 +399,22 @@ final class InterpretationSession {
         }
     }
 
-    private func startTicker() {
+    private func startTicker(intervalNanoseconds: UInt64) {
         stopTicker()
         tickerTask = Task { @MainActor [weak self] in
             while !Task.isCancelled {
-                try? await Task.sleep(nanoseconds: 200_000_000)
                 guard let self else { return }
+                try? await Task.sleep(nanoseconds: intervalNanoseconds)
+                guard !Task.isCancelled else { return }
                 let snapshot = self.aggregator.tick()
                 self.delegate?.interpretationSession(self, didUpdateSubtitles: snapshot)
+                if (self.state == .idle || self.state == .error),
+                   snapshot.current.isEmpty,
+                   snapshot.previous == nil
+                {
+                    self.tickerTask = nil
+                    return
+                }
             }
         }
     }

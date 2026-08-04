@@ -26,6 +26,43 @@ final class SpokenLanguageDetectorTests: XCTestCase {
         XCTAssertEqual(result.translationTarget, .japanese)
     }
 
+    func testDefersSingleLatinProperNoun() {
+        // Given: 日英どちらの発話にも現れ得るLatin固有名詞
+        let text = "Cursor"
+
+        // When: 発話言語の証拠と判定結果を調べる
+        let evidence = SpokenLanguageDetector.evidence(in: text)
+        let result = SpokenLanguageDetector.detect(text)
+
+        // Then: Latin一語だけでは英語に固定しない
+        XCTAssertEqual(evidence, .ambiguousLatin)
+        XCTAssertEqual(result, .unknown)
+        XCTAssertNil(result.translationTarget)
+    }
+
+    func testDefersSingleLatinAcronym() {
+        // Given: 日英どちらでも使われるLatin略語
+        let text = "MCP"
+
+        // When: 発話言語の証拠を調べる
+        let evidence = SpokenLanguageDetector.evidence(in: text)
+
+        // Then: 略語一語だけでは英語の証拠にしない
+        XCTAssertEqual(evidence, .ambiguousLatin)
+    }
+
+    func testUsesMultipleLatinWordsAsEnglishEvidence() {
+        // Given: 複数のLatin単語からなる英語文
+        let text = "Open the file"
+
+        // When: 発話言語の証拠を調べる
+        let evidence = SpokenLanguageDetector.evidence(in: text)
+
+        // Then: 複数語は英語の証拠として扱う
+        XCTAssertEqual(evidence, .english)
+        XCTAssertEqual(SpokenLanguageDetector.detect(text), .english)
+    }
+
     func testReturnsUnknownForEmptyText() {
         // Given: 空の認識結果
         let text = ""

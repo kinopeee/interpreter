@@ -1,4 +1,5 @@
-import AppKit
+ import AppKit
+import Darwin
 import Foundation
 
 /// Pure AppKit entry. Avoid SwiftUI `App` lifecycle.
@@ -36,46 +37,147 @@ enum AppStatusFile {
     }
 }
 
+enum AppRuntimeEnvironment {
+    static func isRunningXCTest(
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> Bool {
+        environment["XCTestConfigurationFilePath"] != nil
+            || environment["XCTestBundlePath"] != nil
+    }
+}
+
+enum SingleInstanceLeaseError: Error {
+    case applicationSupportDirectoryUnavailable
+    case bundleIdentifierUnavailable
+    case invalidLockPath
+    case openFailed(Int32)
+    case ownerMetadataWriteFailed(Int32)
+}
+
+final class SingleInstanceLease {
+    private var fileDescriptor: Int32?
+
+    private init(fileDescriptor: Int32) {
+        self.fileDescriptor = fileDescriptor
+    }
+
+    static func acquireForCurrentUser() throws -> SingleInstanceLease? {
+        guard let bundleIdentifier = Bundle.main.bundleIdentifier else {
+            throw SingleInstanceLeaseError.bundleIdentifierUnavailable
+        }
+        guard let applicationSupportDirectory = FileManager.default.urls(
+            for: .applicationSupportDirectory,
+            in: .userDomainMask
+        ).first else {
+            throw SingleInstanceLeaseError.applicationSupportDirectoryUnavailable
+        }
+
+        let runtimeDirectory = applicationSupportDirectory.appendingPathComponent(
+            bundleIdentifier,
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(
+            at: runtimeDirectory,
+            withIntermediateDirectories: true
+        )
+        return try acquire(
+            at: runtimeDirectory.appendingPathComponent("instance.lock")
+        )
+    }
+
+    static func acquire(at lockURL: URL) throws -> SingleInstanceLease? {
+        let flags = O_CREAT | O_RDWR | O_EXLOCK | O_NONBLOCK | O_CLOEXEC | O_NOFOLLOW
+        guard let descriptor = lockURL.withUnsafeFileSystemRepresentation({ path -> Int32? in
+            guard let path else { return nil }
+            return Darwin.open(
+                path,
+                flags,
+                mode_t(S_IRUSR | S_IWUSR)
+            )
+        }) else {
+            throw SingleInstanceLeaseError.invalidLockPath
+        }
+
+        guard descriptor >= 0 else {
+            let errorNumber = errno
+            if errorNumber == EWOULDBLOCK || errorNumber == EAGAIN {
+                return nil
+            }
+            throw SingleInstanceLeaseError.openFailed(errorNumber)
+        }
+        do {
+            try writeOwnerPID(to: descriptor)
+        } catch {
+            Darwin.close(descriptor)
+            throw error
+        }
+        return SingleInstanceLease(fileDescriptor: descriptor)
+    }
+
+    func release() {
+        guard let fileDescriptor else { return }
+        self.fileDescriptor = nil
+        _ = Darwin.ftruncate(fileDescriptor, 0)
+        Darwin.close(fileDescriptor)
+    }
+
+    deinit {
+        release()
+    }
+
+    private static func writeOwnerPID(to descriptor: Int32) throws {
+        guard Darwin.ftruncate(descriptor, 0) == 0,
+              Darwin.lseek(descriptor, 0, SEEK_SET) >= 0
+        else {
+            throw SingleInstanceLeaseError.ownerMetadataWriteFailed(errno)
+        }
+
+        let metadata = "\(Darwin.getpid())\n"
+        let bytes = Array(metadata.utf8)
+        let written = bytes.withUnsafeBytes { rawBuffer -> Int in
+            guard let baseAddress = rawBuffer.baseAddress else { return 0 }
+            return Darwin.write(descriptor, baseAddress, rawBuffer.count)
+        }
+        guard written == bytes.count else {
+            throw SingleInstanceLeaseError.ownerMetadataWriteFailed(errno)
+        }
+    }
+}
+
 @MainActor
 enum AppRuntime {
     private(set) static var coordinator: AppCoordinator?
     private static var keepAliveWindow: NSWindow?
-    private static var didStart = false
-    private static var duplicateCleanupAttempts = 0
+    private static var instanceLease: SingleInstanceLease?
+    private static var didAttemptStart = false
 
     static func start() {
-        guard !didStart else { return }
-        guard terminateOtherInstancesIfNeeded() else { return }
-        didStart = true
+        guard !AppRuntimeEnvironment.isRunningXCTest() else { return }
+        guard !didAttemptStart else { return }
+        didAttemptStart = true
+
+        do {
+            guard let lease = try SingleInstanceLease.acquireForCurrentUser() else {
+                AppLogger.general.notice(
+                    "Another app instance owns the runtime lock; exiting duplicate"
+                )
+                NSApp.terminate(nil)
+                return
+            }
+            instanceLease = lease
+        } catch {
+            AppLogger.general.error(
+                "Failed to acquire runtime lock: \(error.localizedDescription, privacy: .public)"
+            )
+            NSApp.terminate(nil)
+            return
+        }
+
         AppStatusFile.write("boot")
         installKeepAliveWindow()
         let coordinator = AppCoordinator()
         self.coordinator = coordinator
         coordinator.start()
-    }
-
-    private static func terminateOtherInstancesIfNeeded() -> Bool {
-        guard let bundleIdentifier = Bundle.main.bundleIdentifier else { return true }
-        let currentPID = ProcessInfo.processInfo.processIdentifier
-        let otherInstances = NSRunningApplication
-            .runningApplications(withBundleIdentifier: bundleIdentifier)
-            .filter { $0.processIdentifier != currentPID && !$0.isTerminated }
-
-        guard !otherInstances.isEmpty else { return true }
-        duplicateCleanupAttempts += 1
-        for instance in otherInstances {
-            if duplicateCleanupAttempts >= 3 {
-                instance.forceTerminate()
-            } else {
-                instance.terminate()
-            }
-        }
-
-        AppStatusFile.write("closing_duplicate")
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
-            AppRuntime.start()
-        }
-        return false
     }
 
     private static func installKeepAliveWindow() {

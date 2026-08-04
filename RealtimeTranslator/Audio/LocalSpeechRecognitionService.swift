@@ -11,6 +11,7 @@ enum LocalSpeechRecognitionError: Error, LocalizedError, Sendable {
     case localeUnsupported(String)
     case audioFormatUnavailable
     case audioConverterUnavailable
+    case audioBufferPoolUnavailable
     case modelInstallationFailed(String)
 
     var errorDescription: String? {
@@ -27,14 +28,149 @@ enum LocalSpeechRecognitionError: Error, LocalizedError, Sendable {
             return "音声認識用の音声形式を取得できません"
         case .audioConverterUnavailable:
             return "音声認識用の音声変換を開始できません"
+        case .audioBufferPoolUnavailable:
+            return "音声認識用の音声バッファを準備できません"
         case .modelInstallationFailed(let message):
             return "音声認識モデルを準備できません: \(message)"
         }
     }
 }
 
-private struct CapturedAudioBuffer: @unchecked Sendable {
+final class CapturedAudioBuffer: @unchecked Sendable {
     let buffer: AVAudioPCMBuffer
+    fileprivate let index: Int
+
+    private weak var pool: CapturedAudioBufferPool?
+    private let isLeased = OSAllocatedUnfairLock(initialState: false)
+
+    fileprivate init(
+        buffer: AVAudioPCMBuffer,
+        index: Int,
+        pool: CapturedAudioBufferPool
+    ) {
+        self.buffer = buffer
+        self.index = index
+        self.pool = pool
+    }
+
+    fileprivate func markLeased() {
+        isLeased.withLock { leased in
+            precondition(!leased, "Audio buffer leased twice")
+            leased = true
+        }
+    }
+
+    func release() {
+        let shouldRecycle = isLeased.withLock { leased in
+            guard leased else { return false }
+            leased = false
+            return true
+        }
+        if shouldRecycle {
+            pool?.recycle(index: index)
+        }
+    }
+}
+
+final class CapturedAudioBufferPool: @unchecked Sendable {
+    private let format: AVAudioFormat
+    private let frameCapacity: AVAudioFrameCount
+    private let availableIndices: OSAllocatedUnfairLock<[Int]>
+    private var buffers: [CapturedAudioBuffer] = []
+
+    init?(
+        format: AVAudioFormat,
+        frameCapacity: AVAudioFrameCount,
+        capacity: Int
+    ) {
+        guard frameCapacity > 0, capacity > 0 else { return nil }
+        self.format = format
+        self.frameCapacity = frameCapacity
+        var indices = Array(0..<capacity)
+        indices.reserveCapacity(capacity)
+        availableIndices = OSAllocatedUnfairLock(initialState: indices)
+        buffers.reserveCapacity(capacity)
+
+        for index in 0..<capacity {
+            guard let buffer = AVAudioPCMBuffer(
+                pcmFormat: format,
+                frameCapacity: frameCapacity
+            ) else {
+                return nil
+            }
+            buffers.append(
+                CapturedAudioBuffer(buffer: buffer, index: index, pool: self)
+            )
+        }
+    }
+
+    var availableCount: Int {
+        availableIndices.withLock { $0.count }
+    }
+
+    func capture(_ source: AVAudioPCMBuffer) -> CapturedAudioBuffer? {
+        guard source.frameLength <= frameCapacity,
+              formatsMatch(source.format, format),
+              let index = availableIndices.withLock({ $0.popLast() })
+        else {
+            return nil
+        }
+
+        let captured = buffers[index]
+        guard copySamples(from: source, to: captured.buffer) else {
+            recycle(index: index)
+            return nil
+        }
+        captured.markLeased()
+        return captured
+    }
+
+    fileprivate func recycle(index: Int) {
+        buffers[index].buffer.frameLength = 0
+        availableIndices.withLock { indices in
+            indices.append(index)
+        }
+    }
+
+    private func formatsMatch(_ first: AVAudioFormat, _ second: AVAudioFormat) -> Bool {
+        first.commonFormat == second.commonFormat
+            && first.sampleRate == second.sampleRate
+            && first.channelCount == second.channelCount
+            && first.isInterleaved == second.isInterleaved
+    }
+
+    private func copySamples(
+        from source: AVAudioPCMBuffer,
+        to destination: AVAudioPCMBuffer
+    ) -> Bool {
+        destination.frameLength = source.frameLength
+        let sourceBuffers = UnsafeMutableAudioBufferListPointer(
+            UnsafeMutablePointer(mutating: source.audioBufferList)
+        )
+        let destinationBuffers = UnsafeMutableAudioBufferListPointer(
+            destination.mutableAudioBufferList
+        )
+        guard sourceBuffers.count == destinationBuffers.count else { return false }
+
+        for index in sourceBuffers.indices {
+            let sourceBuffer = sourceBuffers[index]
+            let sourceByteCount = Int(sourceBuffer.mDataByteSize)
+            guard sourceByteCount <= Int(destinationBuffers[index].mDataByteSize)
+            else {
+                return false
+            }
+            if sourceByteCount > 0 {
+                guard let sourceData = sourceBuffer.mData,
+                      let destinationData = destinationBuffers[index].mData
+                else {
+                    return false
+                }
+                memcpy(destinationData, sourceData, sourceByteCount)
+            }
+            destinationBuffers[index].mDataByteSize = sourceBuffer.mDataByteSize
+        }
+        return true
+    }
 }
 
 private enum SpeechAuthorization {
@@ -137,25 +273,30 @@ private final class AnalyzerAudioConverter: @unchecked Sendable {
     }
 }
 
-private final class AnalyzerAudioTap: @unchecked Sendable {
+final class AnalyzerAudioTap: @unchecked Sendable {
     private let continuation: AsyncStream<CapturedAudioBuffer>.Continuation
-    private let didLogFirstBuffer = OSAllocatedUnfairLock(initialState: false)
+    private let bufferPool: CapturedAudioBufferPool
 
-    init(continuation: AsyncStream<CapturedAudioBuffer>.Continuation) {
+    init(
+        continuation: AsyncStream<CapturedAudioBuffer>.Continuation,
+        bufferPool: CapturedAudioBufferPool
+    ) {
         self.continuation = continuation
+        self.bufferPool = bufferPool
     }
 
     func receive(_ buffer: AVAudioPCMBuffer) {
-        let isFirstBuffer = didLogFirstBuffer.withLock { didLog in
-            guard !didLog else { return false }
-            didLog = true
-            return true
+        guard let captured = bufferPool.capture(buffer) else { return }
+        switch continuation.yield(captured) {
+        case .enqueued:
+            break
+        case .dropped(let dropped):
+            dropped.release()
+        case .terminated:
+            captured.release()
+        @unknown default:
+            captured.release()
         }
-        if isFirstBuffer {
-            AppLogger.audio.info("[debug:C] First audio buffer received off MainActor")
-        }
-
-        continuation.yield(CapturedAudioBuffer(buffer: buffer))
     }
 }
 
@@ -181,6 +322,7 @@ final class LocalSpeechRecognitionService: LocalSpeechRecognitionServicing {
     private var audioConverter: AnalyzerAudioConverter?
     private var speechArbiter = BilingualSpeechArbiter()
     private var languageSelectionTask: Task<Void, Never>?
+    private var languageSelectionTaskGeneration = 0
     private var lastEmittedSignature: String?
     private var lifecycleState: LifecycleState = .idle
     private var lifecycleGeneration = 0
@@ -277,6 +419,19 @@ final class LocalSpeechRecognitionService: LocalSpeechRecognitionServicing {
             ) else {
                 throw LocalSpeechRecognitionError.audioConverterUnavailable
             }
+            let requestedTapBufferSize: AVAudioFrameCount = 4096
+            let captureFrameCapacity = max(
+                requestedTapBufferSize,
+                AVAudioFrameCount(inputFormat.sampleRate.rounded(.up))
+            )
+            let captureBufferPoolCapacity = 64
+            guard let captureBufferPool = CapturedAudioBufferPool(
+                format: inputFormat,
+                frameCapacity: captureFrameCapacity,
+                capacity: captureBufferPoolCapacity
+            ) else {
+                throw LocalSpeechRecognitionError.audioBufferPoolUnavailable
+            }
 
             let analyzer = SpeechAnalyzer(modules: modules)
             startupAnalyzer = analyzer
@@ -285,7 +440,9 @@ final class LocalSpeechRecognitionService: LocalSpeechRecognitionServicing {
 
             let (captureStream, captureContinuation) =
                 AsyncStream<CapturedAudioBuffer>.makeStream(
-                    bufferingPolicy: .bufferingNewest(64)
+                    bufferingPolicy: .bufferingNewest(
+                        captureBufferPoolCapacity - 2
+                    )
                 )
             let (inputStream, continuation) = AsyncStream<AnalyzerInput>.makeStream(
                 bufferingPolicy: .bufferingNewest(32)
@@ -308,6 +465,7 @@ final class LocalSpeechRecognitionService: LocalSpeechRecognitionServicing {
 
                 do {
                     for await captured in captureStream {
+                        defer { captured.release() }
                         try Task.checkCancellation()
                         let converted = try converter.convert(captured.buffer)
                         continuation.yield(AnalyzerInput(buffer: converted))
@@ -326,14 +484,17 @@ final class LocalSpeechRecognitionService: LocalSpeechRecognitionServicing {
             }
             startupFeederTask = feederTask
 
-            let audioTap = AnalyzerAudioTap(continuation: captureContinuation)
+            let audioTap = AnalyzerAudioTap(
+                continuation: captureContinuation,
+                bufferPool: captureBufferPool
+            )
             let tapBlock: @Sendable (AVAudioPCMBuffer, AVAudioTime) -> Void = { buffer, _ in
                 audioTap.receive(buffer)
             }
             inputNode.removeTap(onBus: 0)
             inputNode.installTap(
                 onBus: 0,
-                bufferSize: 4096,
+                bufferSize: requestedTapBufferSize,
                 format: inputFormat,
                 block: tapBlock
             )
@@ -353,8 +514,7 @@ final class LocalSpeechRecognitionService: LocalSpeechRecognitionServicing {
             audioConverter = converter
             isTapInstalled = true
             speechArbiter.reset()
-            languageSelectionTask?.cancel()
-            languageSelectionTask = nil
+            cancelLanguageSelectionTask()
             lastEmittedSignature = nil
             acceptedResultGeneration = generation
             isRunning = true
@@ -422,10 +582,11 @@ final class LocalSpeechRecognitionService: LocalSpeechRecognitionServicing {
         for task in resultTasks {
             await task.value
         }
+        let languageSelectionTask = self.languageSelectionTask
+        cancelLanguageSelectionTask()
         if let languageSelectionTask {
             await languageSelectionTask.value
         }
-        languageSelectionTask = nil
         japaneseTranscriber = nil
         englishTranscriber = nil
         audioConverter = nil
@@ -559,7 +720,6 @@ final class LocalSpeechRecognitionService: LocalSpeechRecognitionServicing {
     ) {
         guard acceptedResultGeneration == generation else { return }
         let text = String(result.text.characters).trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty else { return }
 
         let confidenceValues = result.text.runs.compactMap(\.transcriptionConfidence)
         let confidence = confidenceValues.isEmpty
@@ -574,27 +734,50 @@ final class LocalSpeechRecognitionService: LocalSpeechRecognitionServicing {
             endTime: result.range.end.seconds
         )
         if let winner = speechArbiter.submit(candidate) {
-            languageSelectionTask?.cancel()
-            languageSelectionTask = nil
+            cancelLanguageSelectionTask()
             emit(winner)
-            return
         }
+        scheduleLanguageSelectionIfNeeded()
+    }
 
+    private func scheduleLanguageSelectionIfNeeded() {
         guard speechArbiter.activeLanguage == nil,
               speechArbiter.hasPendingCandidates,
-              languageSelectionTask == nil
+              languageSelectionTask == nil,
+              let generation = acceptedResultGeneration
         else {
             return
         }
 
+        languageSelectionTaskGeneration += 1
+        let taskGeneration = languageSelectionTaskGeneration
         languageSelectionTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer {
+                if self.languageSelectionTaskGeneration == taskGeneration {
+                    self.languageSelectionTask = nil
+                }
+            }
+
             try? await Task.sleep(nanoseconds: 180_000_000)
-            guard let self, !Task.isCancelled else { return }
-            self.languageSelectionTask = nil
-            if let winner = self.speechArbiter.selectBestAvailable() {
+            while !Task.isCancelled {
+                guard !Task.isCancelled,
+                      self.acceptedResultGeneration == generation,
+                      self.speechArbiter.activeLanguage == nil,
+                      self.speechArbiter.hasPendingCandidates,
+                      let winner = self.speechArbiter.selectBestAvailable()
+                else {
+                    return
+                }
                 self.emit(winner)
             }
         }
+    }
+
+    private func cancelLanguageSelectionTask() {
+        languageSelectionTaskGeneration += 1
+        languageSelectionTask?.cancel()
+        languageSelectionTask = nil
     }
 
     private func emit(_ candidate: SpeechRecognitionCandidate) {
@@ -602,6 +785,7 @@ final class LocalSpeechRecognitionService: LocalSpeechRecognitionServicing {
             String(describing: candidate.language),
             String(candidate.isFinal),
             String(candidate.startTime),
+            String(candidate.endTime),
             candidate.text,
         ].joined(separator: "|")
         guard signature != lastEmittedSignature else { return }

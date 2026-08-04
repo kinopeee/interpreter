@@ -41,4 +41,30 @@ struct SubtitleSnapshot: Equatable, Sendable {
         statusBanner: nil,
         previousOpacity: 1
     )
+
+    var presentation: SubtitlePresentation {
+        SubtitlePresentation(
+            current: SubtitlePresentation.Block(current),
+            previous: previous.map(SubtitlePresentation.Block.init),
+            statusBanner: statusBanner,
+            previousOpacity: previousOpacity
+        )
+    }
+}
+
+struct SubtitlePresentation: Equatable, Sendable {
+    struct Block: Equatable, Sendable {
+        let sourceText: String
+        let translatedText: String
+
+        init(_ subtitle: LiveSubtitle) {
+            sourceText = subtitle.sourceText
+            translatedText = subtitle.translatedText
+        }
+    }
+
+    let current: Block
+    let previous: Block?
+    let statusBanner: String?
+    let previousOpacity: Double
 }
