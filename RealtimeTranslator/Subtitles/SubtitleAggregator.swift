@@ -100,7 +100,42 @@ final class SubtitleAggregator: @unchecked Sendable {
     func forceFinalize(now: Date = Date()) -> SubtitleSnapshot {
         lock.lock()
         defer { lock.unlock() }
-        promoteCurrentLocked(now: now)
+        if hasCompletePair(current) {
+            promoteCurrentLocked(now: now)
+        } else {
+            clearCurrentLocked(now: now)
+        }
+        updatePreviousOpacityLocked(now: now)
+        return snapshotLocked(now: now)
+    }
+
+    @discardableResult
+    func finalizePair(
+        sourceText: String,
+        translatedText: String,
+        clearCurrent: Bool,
+        now: Date = Date()
+    ) -> SubtitleSnapshot {
+        lock.lock()
+        defer { lock.unlock() }
+        let finalized = LiveSubtitle(
+            sourceText: sourceText,
+            translatedText: translatedText,
+            lastUpdatedAt: now,
+            state: .finalized,
+            isTranslationCurrent: true,
+            canFinalize: true
+        )
+        guard hasCompletePair(finalized) else {
+            return snapshotLocked(now: now)
+        }
+
+        previous = finalized
+        previousFinalizedAt = now
+        previousOpacity = 1
+        if clearCurrent {
+            clearCurrentLocked(now: now)
+        }
         updatePreviousOpacityLocked(now: now)
         return snapshotLocked(now: now)
     }
@@ -115,11 +150,7 @@ final class SubtitleAggregator: @unchecked Sendable {
     private func finalizeIfNeededLocked(now: Date) {
         guard !current.isEmpty else { return }
 
-        let hasCompletePair = !current.sourceText.isEmpty
-            && !current.translatedText.isEmpty
-            && current.isTranslationCurrent
-            && current.canFinalize
-        guard hasCompletePair else { return }
+        guard hasCompletePair(current) else { return }
 
         let idleExpired = now.timeIntervalSince(current.lastUpdatedAt) >= config.idleFinalizeInterval
         // Wait for target punctuation. Source punctuation often arrives before translation
@@ -134,13 +165,17 @@ final class SubtitleAggregator: @unchecked Sendable {
     }
 
     private func promoteCurrentLocked(now: Date) {
-        guard !current.isEmpty else { return }
+        guard hasCompletePair(current) else { return }
         var finalized = current
         finalized.state = .finalized
         finalized.lastUpdatedAt = now
         previous = finalized
         previousFinalizedAt = now
         previousOpacity = 1
+        clearCurrentLocked(now: now)
+    }
+
+    private func clearCurrentLocked(now: Date) {
         current = LiveSubtitle(
             sourceText: "",
             translatedText: "",
@@ -149,6 +184,13 @@ final class SubtitleAggregator: @unchecked Sendable {
             isTranslationCurrent: false,
             canFinalize: false
         )
+    }
+
+    private func hasCompletePair(_ subtitle: LiveSubtitle) -> Bool {
+        !subtitle.sourceText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && !subtitle.translatedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && subtitle.isTranslationCurrent
+            && subtitle.canFinalize
     }
 
     private func updatePreviousOpacityLocked(now: Date) {

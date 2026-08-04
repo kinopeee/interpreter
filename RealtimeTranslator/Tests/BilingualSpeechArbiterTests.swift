@@ -50,6 +50,27 @@ final class BilingualSpeechArbiterTests: XCTestCase {
         XCTAssertEqual(arbiter.activeLanguage, .english)
     }
 
+    func testIgnoresLateOppositeFinalForFinalizedRange() {
+        // Given: 同一区間で日本語レーンを選択し、確定結果まで受信した判定器
+        var arbiter = BilingualSpeechArbiter()
+        _ = arbiter.submit(candidate(language: .english, confidence: 0.4))
+        _ = arbiter.submit(candidate(language: .japanese, confidence: 0.9))
+        let finalized = arbiter.submit(
+            candidate(language: .japanese, confidence: 0.92, isFinal: true)
+        )
+
+        // When: 同じ音声範囲の英語レーン確定結果が遅れて届く
+        let lateOpposite = arbiter.submit(
+            candidate(language: .english, confidence: 0.99, isFinal: true)
+        )
+
+        // Then: 同じ音声を別発話として再選択しない
+        XCTAssertTrue(finalized?.isFinal == true)
+        XCTAssertNil(lateOpposite)
+        XCTAssertNil(arbiter.activeLanguage)
+        XCTAssertFalse(arbiter.hasPendingCandidates)
+    }
+
     private func candidate(
         language: SpokenLanguage,
         confidence: Double,

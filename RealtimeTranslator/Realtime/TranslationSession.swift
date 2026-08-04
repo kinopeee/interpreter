@@ -36,10 +36,16 @@ final class InterpretationSession {
         let isFinal: Bool
     }
 
+    private struct FinalTranslationRequest {
+        let sourceText: String
+        let language: SpokenLanguage
+        let sourceGeneration: Int
+    }
+
     weak var delegate: InterpretationSessionDelegate?
 
-    private let speechService = LocalSpeechRecognitionService()
-    private let translationService: LocalTranslationService
+    private let speechService: any LocalSpeechRecognitionServicing
+    private let translationService: any LocalTranslationServicing
     private let aggregator = SubtitleAggregator()
 
     private(set) var state: TranslationState = .idle {
@@ -50,22 +56,32 @@ final class InterpretationSession {
     }
 
     private var tickerTask: Task<Void, Never>?
-    private var translationTask: Task<Void, Never>?
+    private var stopTask: Task<Void, Never>?
+    private var liveTranslationTask: Task<Void, Never>?
+    private var finalTranslationWorker: Task<Void, Never>?
+    private var finalTranslationQueue: [FinalTranslationRequest] = []
     private var transcriptionRenderTask: Task<Void, Never>?
     private var pendingTranscription: PendingTranscription?
     private var lastTranscriptionRenderedAt = Date.distantPast
-    private var translationGeneration = 0
+    private var lifecycleGeneration = 0
+    private var sourceGeneration = 0
     private var currentSourceText = ""
     private var currentTranslationText = ""
     private var currentLanguage: SpokenLanguage = .unknown
 
-    init(translationService: LocalTranslationService) {
+    init(
+        translationService: any LocalTranslationServicing,
+        speechService: any LocalSpeechRecognitionServicing = LocalSpeechRecognitionService()
+    ) {
         self.translationService = translationService
+        self.speechService = speechService
         speechService.delegate = self
     }
 
     func start() async {
         guard state == .idle || state == .error else { return }
+        lifecycleGeneration += 1
+        let generation = lifecycleGeneration
         state = .connecting
         aggregator.reset()
         transcriptionRenderTask?.cancel()
@@ -74,32 +90,66 @@ final class InterpretationSession {
         currentSourceText = ""
         currentTranslationText = ""
         currentLanguage = .unknown
+        sourceGeneration = 0
+        liveTranslationTask?.cancel()
+        liveTranslationTask = nil
+        finalTranslationQueue.removeAll()
         aggregator.setStatusBanner("ローカル音声認識を準備中…")
         publishSubtitles()
 
         do {
             try await speechService.start()
+            guard lifecycleGeneration == generation, state == .connecting else {
+                await speechService.stop()
+                return
+            }
             state = .listening
             aggregator.setStatusBanner("録音中… 話してください")
             startTicker()
             publishSubtitles()
+        } catch is CancellationError {
+            guard lifecycleGeneration == generation, state == .connecting else { return }
+            aggregator.setStatusBanner(nil)
+            state = .idle
+            publishSubtitles()
         } catch {
+            guard lifecycleGeneration == generation, state == .connecting else { return }
             enterError(error)
         }
     }
 
     func stop() async {
+        if let stopTask {
+            await stopTask.value
+            return
+        }
         guard state != .idle else { return }
+
+        let task = Task { @MainActor [weak self] in
+            guard let self else { return }
+            await self.performStop()
+        }
+        stopTask = task
+        await task.value
+        stopTask = nil
+    }
+
+    private func performStop() async {
+        lifecycleGeneration += 1
         state = .closing
         aggregator.setStatusBanner("録音を終了中…")
         publishSubtitles()
 
-        await speechService.stop()
         transcriptionRenderTask?.cancel()
         transcriptionRenderTask = nil
         pendingTranscription = nil
-        translationTask?.cancel()
-        translationTask = nil
+        liveTranslationTask?.cancel()
+        liveTranslationTask = nil
+
+        await speechService.stop()
+        if let finalTranslationWorker {
+            await finalTranslationWorker.value
+        }
         stopTicker()
 
         let snapshot = aggregator.forceFinalize()
@@ -114,7 +164,8 @@ final class InterpretationSession {
         language: SpokenLanguage,
         isFinal: Bool
     ) {
-        guard state == .listening, language != .unknown else { return }
+        let acceptsTranscription = state == .listening || (state == .closing && isFinal)
+        guard acceptsTranscription, language != .unknown else { return }
         let pending = PendingTranscription(
             text: text,
             language: language,
@@ -153,8 +204,8 @@ final class InterpretationSession {
         guard text != currentSourceText || isFinal else { return }
         lastTranscriptionRenderedAt = Date()
 
-        translationGeneration += 1
-        let generation = translationGeneration
+        sourceGeneration += 1
+        let generation = sourceGeneration
         let preservesTranslation = language == currentLanguage
             && !currentTranslationText.isEmpty
             && !currentSourceText.isEmpty
@@ -163,9 +214,12 @@ final class InterpretationSession {
         }
         currentSourceText = text
         currentLanguage = language
-        translationTask?.cancel()
+        liveTranslationTask?.cancel()
+        liveTranslationTask = nil
 
-        aggregator.setStatusBanner(nil)
+        if state == .listening {
+            aggregator.setStatusBanner(nil)
+        }
         let sourceSnapshot = aggregator.replaceCurrent(
             sourceText: text,
             translatedText: currentTranslationText,
@@ -174,20 +228,30 @@ final class InterpretationSession {
         )
         delegate?.interpretationSession(self, didUpdateSubtitles: sourceSnapshot)
 
-        translationTask = Task { @MainActor [weak self] in
+        if isFinal {
+            enqueueFinalTranslation(
+                sourceText: text,
+                language: language,
+                sourceGeneration: generation
+            )
+            return
+        }
+
+        liveTranslationTask = Task { @MainActor [weak self] in
             guard let self else { return }
-            if !isFinal {
-                try? await Task.sleep(nanoseconds: 300_000_000)
-                guard !Task.isCancelled else { return }
-            }
+            try? await Task.sleep(nanoseconds: 300_000_000)
+            guard !Task.isCancelled else { return }
 
             do {
                 let translated = try await self.translationService.translate(
                     text,
                     from: language,
-                    priority: isFinal ? .final : .live
+                    priority: .live
                 )
-                guard !Task.isCancelled, generation == self.translationGeneration else {
+                guard !Task.isCancelled,
+                      generation == self.sourceGeneration,
+                      self.currentSourceText == text
+                else {
                     return
                 }
 
@@ -196,31 +260,81 @@ final class InterpretationSession {
                     sourceText: self.currentSourceText,
                     translatedText: translated,
                     isTranslationCurrent: true,
-                    canFinalize: isFinal
+                    canFinalize: false
                 )
-                if isFinal {
-                    let finalized = self.aggregator.forceFinalize()
-                    self.currentSourceText = ""
-                    self.currentTranslationText = ""
-                    self.currentLanguage = .unknown
-                    self.delegate?.interpretationSession(
-                        self,
-                        didUpdateSubtitles: finalized
-                    )
-                } else {
-                    self.delegate?.interpretationSession(
-                        self,
-                        didUpdateSubtitles: snapshot
-                    )
-                }
+                self.delegate?.interpretationSession(
+                    self,
+                    didUpdateSubtitles: snapshot
+                )
             } catch is CancellationError {
                 return
             } catch {
-                guard generation == self.translationGeneration else { return }
+                guard generation == self.sourceGeneration else { return }
                 self.aggregator.setStatusBanner("ローカル翻訳を準備中…")
                 self.publishSubtitles()
                 AppLogger.general.error(
                     "Local translation failed: \(error.localizedDescription, privacy: .public)"
+                )
+            }
+        }
+    }
+
+    private func enqueueFinalTranslation(
+        sourceText: String,
+        language: SpokenLanguage,
+        sourceGeneration: Int
+    ) {
+        finalTranslationQueue.append(
+            FinalTranslationRequest(
+                sourceText: sourceText,
+                language: language,
+                sourceGeneration: sourceGeneration
+            )
+        )
+        guard finalTranslationWorker == nil else { return }
+
+        finalTranslationWorker = Task { @MainActor [weak self] in
+            await self?.processFinalTranslationQueue()
+        }
+    }
+
+    private func processFinalTranslationQueue() async {
+        defer { finalTranslationWorker = nil }
+
+        while !finalTranslationQueue.isEmpty {
+            let request = finalTranslationQueue.removeFirst()
+            do {
+                let translated = try await translationService.translate(
+                    request.sourceText,
+                    from: request.language,
+                    priority: .final
+                )
+                let clearsCurrent = request.sourceGeneration == sourceGeneration
+                if clearsCurrent {
+                    currentSourceText = ""
+                    currentTranslationText = ""
+                    currentLanguage = .unknown
+                }
+                let finalized = aggregator.finalizePair(
+                    sourceText: request.sourceText,
+                    translatedText: translated,
+                    clearCurrent: clearsCurrent
+                )
+                delegate?.interpretationSession(
+                    self,
+                    didUpdateSubtitles: finalized
+                )
+            } catch is CancellationError {
+                if Task.isCancelled {
+                    finalTranslationQueue.removeAll()
+                    return
+                }
+                continue
+            } catch {
+                aggregator.setStatusBanner("ローカル翻訳を準備中…")
+                publishSubtitles()
+                AppLogger.general.error(
+                    "Final local translation failed: \(error.localizedDescription, privacy: .public)"
                 )
             }
         }
@@ -257,7 +371,6 @@ final class InterpretationSession {
 
 extension InterpretationSession: LocalSpeechRecognitionServiceDelegate {
     func localSpeechRecognitionService(
-        _ service: LocalSpeechRecognitionService,
         didUpdate text: String,
         language: SpokenLanguage,
         isFinal: Bool
@@ -266,7 +379,6 @@ extension InterpretationSession: LocalSpeechRecognitionServiceDelegate {
     }
 
     func localSpeechRecognitionService(
-        _ service: LocalSpeechRecognitionService,
         didUpdateStatus message: String
     ) {
         aggregator.setStatusBanner(message)
@@ -274,10 +386,13 @@ extension InterpretationSession: LocalSpeechRecognitionServiceDelegate {
     }
 
     func localSpeechRecognitionService(
-        _ service: LocalSpeechRecognitionService,
         didFail error: Error
     ) {
-        enterError(error)
-        Task { await stop() }
+        Task { @MainActor [weak self] in
+            guard let self, self.state != .closing else { return }
+            await self.stop()
+            guard self.state == .idle else { return }
+            self.enterError(error)
+        }
     }
 }

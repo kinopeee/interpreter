@@ -125,4 +125,40 @@ final class SubtitleAggregatorTests: XCTestCase {
         XCTAssertEqual(snapshot.previous?.sourceText, "Still speaking")
         XCTAssertEqual(snapshot.previous?.translatedText, "まだ話しています")
     }
+
+    func testForceFinalizeDiscardsSourceWithoutTranslation() {
+        // Given: 翻訳が届いていない原文だけのライブ字幕
+        let aggregator = SubtitleAggregator()
+        _ = aggregator.replaceCurrent(
+            sourceText: "Still speaking",
+            translatedText: "",
+            isTranslationCurrent: false,
+            canFinalize: false
+        )
+
+        // When: 録音停止時に強制確定する
+        let snapshot = aggregator.forceFinalize()
+
+        // Then: 原文だけを確定せず、ライブ字幕も破棄する
+        XCTAssertTrue(snapshot.current.isEmpty)
+        XCTAssertNil(snapshot.previous)
+    }
+
+    func testForceFinalizeDiscardsStaleTranslationPair() {
+        // Given: 新しい原文と旧訳文を一時表示しているライブ字幕
+        let aggregator = SubtitleAggregator()
+        _ = aggregator.replaceCurrent(
+            sourceText: "A new sentence",
+            translatedText: "古い翻訳です",
+            isTranslationCurrent: false,
+            canFinalize: false
+        )
+
+        // When: 録音停止時に強制確定する
+        let snapshot = aggregator.forceFinalize()
+
+        // Then: 誤った原文・訳文ペアを確定せず、ライブ字幕も破棄する
+        XCTAssertTrue(snapshot.current.isEmpty)
+        XCTAssertNil(snapshot.previous)
+    }
 }

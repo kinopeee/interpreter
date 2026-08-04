@@ -59,19 +59,23 @@ private enum SpeechAuthorization {
 }
 
 @MainActor
+protocol LocalSpeechRecognitionServicing: AnyObject {
+    var delegate: LocalSpeechRecognitionServiceDelegate? { get set }
+    func start() async throws
+    func stop() async
+}
+
+@MainActor
 protocol LocalSpeechRecognitionServiceDelegate: AnyObject {
     func localSpeechRecognitionService(
-        _ service: LocalSpeechRecognitionService,
         didUpdate text: String,
         language: SpokenLanguage,
         isFinal: Bool
     )
     func localSpeechRecognitionService(
-        _ service: LocalSpeechRecognitionService,
         didUpdateStatus message: String
     )
     func localSpeechRecognitionService(
-        _ service: LocalSpeechRecognitionService,
         didFail error: Error
     )
 }
@@ -156,7 +160,14 @@ private final class AnalyzerAudioTap: @unchecked Sendable {
 }
 
 @MainActor
-final class LocalSpeechRecognitionService {
+final class LocalSpeechRecognitionService: LocalSpeechRecognitionServicing {
+    private enum LifecycleState: Equatable {
+        case idle
+        case starting(Int)
+        case running(Int)
+        case stopping(Int)
+    }
+
     weak var delegate: LocalSpeechRecognitionServiceDelegate?
 
     private let audioEngine = AVAudioEngine()
@@ -171,6 +182,10 @@ final class LocalSpeechRecognitionService {
     private var speechArbiter = BilingualSpeechArbiter()
     private var languageSelectionTask: Task<Void, Never>?
     private var lastEmittedSignature: String?
+    private var lifecycleState: LifecycleState = .idle
+    private var lifecycleGeneration = 0
+    private var acceptedResultGeneration: Int?
+    private var isTapInstalled = false
     private(set) var isRunning = false
 
     func requestPermission() async -> Bool {
@@ -182,148 +197,301 @@ final class LocalSpeechRecognitionService {
     }
 
     func start() async throws {
-        guard !isRunning else { return }
-        guard await requestPermission() else {
-            throw LocalSpeechRecognitionError.microphoneDenied
-        }
-        guard await SpeechAuthorization.request() else {
-            throw LocalSpeechRecognitionError.speechRecognitionDenied
-        }
-        guard SpeechTranscriber.isAvailable else {
-            throw LocalSpeechRecognitionError.speechTranscriberUnavailable
-        }
+        guard lifecycleState == .idle else { return }
+        lifecycleGeneration += 1
+        let generation = lifecycleGeneration
+        lifecycleState = .starting(generation)
 
-        delegate?.localSpeechRecognitionService(self, didUpdateStatus: "日英音声認識モデルを確認中…")
-
-        let japaneseLocale = try await supportedLocale(identifier: "ja-JP")
-        let englishLocale = try await supportedLocale(identifier: "en-US")
-        let japaneseTranscriber = makeTranscriber(locale: japaneseLocale)
-        let englishTranscriber = makeTranscriber(locale: englishLocale)
-        let modules: [any SpeechModule] = [japaneseTranscriber, englishTranscriber]
+        var startupAnalyzer: SpeechAnalyzer?
+        var startupCaptureContinuation: AsyncStream<CapturedAudioBuffer>.Continuation?
+        var startupInputContinuation: AsyncStream<AnalyzerInput>.Continuation?
+        var startupFeederTask: Task<Void, Never>?
+        var startupResultTasks: [Task<Void, Never>] = []
+        var startupTapInstalled = false
 
         do {
-            if let request = try await AssetInventory.assetInstallationRequest(supporting: modules) {
-                delegate?.localSpeechRecognitionService(
-                    self,
-                    didUpdateStatus: "日英音声認識モデルをダウンロード中…"
-                )
-                try await request.downloadAndInstall()
+            let microphoneGranted = await requestPermission()
+            try ensureStartupIsCurrent(generation)
+            guard microphoneGranted else {
+                throw LocalSpeechRecognitionError.microphoneDenied
             }
-        } catch {
-            throw LocalSpeechRecognitionError.modelInstallationFailed(error.localizedDescription)
-        }
 
-        guard let analyzerFormat = await SpeechAnalyzer.bestAvailableAudioFormat(
-            compatibleWith: modules
-        ) else {
-            throw LocalSpeechRecognitionError.audioFormatUnavailable
-        }
+            let speechRecognitionGranted = await SpeechAuthorization.request()
+            try ensureStartupIsCurrent(generation)
+            guard speechRecognitionGranted else {
+                throw LocalSpeechRecognitionError.speechRecognitionDenied
+            }
+            guard SpeechTranscriber.isAvailable else {
+                throw LocalSpeechRecognitionError.speechTranscriberUnavailable
+            }
 
-        let inputNode = audioEngine.inputNode
-        let inputFormat = inputNode.outputFormat(forBus: 0)
-        guard inputFormat.sampleRate > 0, inputFormat.channelCount > 0 else {
-            throw LocalSpeechRecognitionError.audioFormatUnavailable
-        }
-        guard let converter = AnalyzerAudioConverter(
-            inputFormat: inputFormat,
-            outputFormat: analyzerFormat
-        ) else {
-            throw LocalSpeechRecognitionError.audioConverterUnavailable
-        }
+            delegate?.localSpeechRecognitionService(
+                didUpdateStatus: "日英音声認識モデルを確認中…"
+            )
 
-        let analyzer = SpeechAnalyzer(modules: modules)
-        try await analyzer.prepareToAnalyze(in: analyzerFormat)
-        let (captureStream, captureContinuation) = AsyncStream<CapturedAudioBuffer>.makeStream(
-            bufferingPolicy: .bufferingNewest(64)
-        )
-        let (inputStream, continuation) = AsyncStream<AnalyzerInput>.makeStream(
-            bufferingPolicy: .bufferingNewest(32)
-        )
-
-        self.analyzer = analyzer
-        self.japaneseTranscriber = japaneseTranscriber
-        self.englishTranscriber = englishTranscriber
-        self.captureContinuation = captureContinuation
-        inputContinuation = continuation
-        audioConverter = converter
-        speechArbiter.reset()
-        languageSelectionTask?.cancel()
-        languageSelectionTask = nil
-        lastEmittedSignature = nil
-
-        startResultTasks(
-            japaneseTranscriber: japaneseTranscriber,
-            englishTranscriber: englishTranscriber
-        )
-        try await analyzer.start(inputSequence: inputStream)
-
-        feederTask = Task.detached(priority: .userInitiated) { [weak self] in
-            defer { continuation.finish() }
+            let japaneseLocale = try await supportedLocale(identifier: "ja-JP")
+            try ensureStartupIsCurrent(generation)
+            let englishLocale = try await supportedLocale(identifier: "en-US")
+            try ensureStartupIsCurrent(generation)
+            let japaneseTranscriber = makeTranscriber(locale: japaneseLocale)
+            let englishTranscriber = makeTranscriber(locale: englishLocale)
+            let modules: [any SpeechModule] = [japaneseTranscriber, englishTranscriber]
 
             do {
-                for await captured in captureStream {
-                    try Task.checkCancellation()
-                    let converted = try converter.convert(captured.buffer)
-                    continuation.yield(AnalyzerInput(buffer: converted))
-                }
-            } catch is CancellationError {
-                return
-            } catch {
-                AppLogger.audio.error(
-                    "Audio feeder failed: \(error.localizedDescription, privacy: .public)"
+                let request = try await AssetInventory.assetInstallationRequest(
+                    supporting: modules
                 )
-                await self?.reportAudioFeederFailure(error)
+                try ensureStartupIsCurrent(generation)
+                if let request {
+                    delegate?.localSpeechRecognitionService(
+                        didUpdateStatus: "日英音声認識モデルをダウンロード中…"
+                    )
+                    try await request.downloadAndInstall()
+                    try ensureStartupIsCurrent(generation)
+                }
+            } catch {
+                guard isStartupCurrent(generation), !(error is CancellationError) else {
+                    throw CancellationError()
+                }
+                throw LocalSpeechRecognitionError.modelInstallationFailed(
+                    error.localizedDescription
+                )
             }
-        }
 
-        let audioTap = AnalyzerAudioTap(continuation: captureContinuation)
-        let tapBlock: @Sendable (AVAudioPCMBuffer, AVAudioTime) -> Void = { buffer, _ in
-            audioTap.receive(buffer)
-        }
-        inputNode.removeTap(onBus: 0)
-        inputNode.installTap(
-            onBus: 0,
-            bufferSize: 4096,
-            format: inputFormat,
-            block: tapBlock
-        )
+            let analyzerFormat = await SpeechAnalyzer.bestAvailableAudioFormat(
+                compatibleWith: modules
+            )
+            try ensureStartupIsCurrent(generation)
+            guard let analyzerFormat else {
+                throw LocalSpeechRecognitionError.audioFormatUnavailable
+            }
 
-        audioEngine.prepare()
-        try audioEngine.start()
-        isRunning = true
-        delegate?.localSpeechRecognitionService(self, didUpdateStatus: "録音中… 話してください")
+            let inputNode = audioEngine.inputNode
+            let inputFormat = inputNode.outputFormat(forBus: 0)
+            guard inputFormat.sampleRate > 0, inputFormat.channelCount > 0 else {
+                throw LocalSpeechRecognitionError.audioFormatUnavailable
+            }
+            guard let converter = AnalyzerAudioConverter(
+                inputFormat: inputFormat,
+                outputFormat: analyzerFormat
+            ) else {
+                throw LocalSpeechRecognitionError.audioConverterUnavailable
+            }
+
+            let analyzer = SpeechAnalyzer(modules: modules)
+            startupAnalyzer = analyzer
+            try await analyzer.prepareToAnalyze(in: analyzerFormat)
+            try ensureStartupIsCurrent(generation)
+
+            let (captureStream, captureContinuation) =
+                AsyncStream<CapturedAudioBuffer>.makeStream(
+                    bufferingPolicy: .bufferingNewest(64)
+                )
+            let (inputStream, continuation) = AsyncStream<AnalyzerInput>.makeStream(
+                bufferingPolicy: .bufferingNewest(32)
+            )
+            startupCaptureContinuation = captureContinuation
+            startupInputContinuation = continuation
+
+            try await analyzer.start(inputSequence: inputStream)
+            try ensureStartupIsCurrent(generation)
+
+            let resultTasks = makeResultTasks(
+                japaneseTranscriber: japaneseTranscriber,
+                englishTranscriber: englishTranscriber,
+                generation: generation
+            )
+            startupResultTasks = resultTasks
+
+            let feederTask = Task.detached(priority: .userInitiated) { [weak self] in
+                defer { continuation.finish() }
+
+                do {
+                    for await captured in captureStream {
+                        try Task.checkCancellation()
+                        let converted = try converter.convert(captured.buffer)
+                        continuation.yield(AnalyzerInput(buffer: converted))
+                    }
+                } catch is CancellationError {
+                    return
+                } catch {
+                    AppLogger.audio.error(
+                        "Audio feeder failed: \(error.localizedDescription, privacy: .public)"
+                    )
+                    await self?.reportAudioFeederFailure(
+                        error,
+                        generation: generation
+                    )
+                }
+            }
+            startupFeederTask = feederTask
+
+            let audioTap = AnalyzerAudioTap(continuation: captureContinuation)
+            let tapBlock: @Sendable (AVAudioPCMBuffer, AVAudioTime) -> Void = { buffer, _ in
+                audioTap.receive(buffer)
+            }
+            inputNode.removeTap(onBus: 0)
+            inputNode.installTap(
+                onBus: 0,
+                bufferSize: 4096,
+                format: inputFormat,
+                block: tapBlock
+            )
+            startupTapInstalled = true
+
+            audioEngine.prepare()
+            try audioEngine.start()
+            try ensureStartupIsCurrent(generation)
+
+            self.analyzer = analyzer
+            self.japaneseTranscriber = japaneseTranscriber
+            self.englishTranscriber = englishTranscriber
+            self.captureContinuation = captureContinuation
+            inputContinuation = continuation
+            self.feederTask = feederTask
+            self.resultTasks = resultTasks
+            audioConverter = converter
+            isTapInstalled = true
+            speechArbiter.reset()
+            languageSelectionTask?.cancel()
+            languageSelectionTask = nil
+            lastEmittedSignature = nil
+            acceptedResultGeneration = generation
+            isRunning = true
+            lifecycleState = .running(generation)
+            delegate?.localSpeechRecognitionService(
+                didUpdateStatus: "録音中… 話してください"
+            )
+        } catch {
+            await cleanUpFailedStart(
+                analyzer: startupAnalyzer,
+                captureContinuation: startupCaptureContinuation,
+                inputContinuation: startupInputContinuation,
+                feederTask: startupFeederTask,
+                resultTasks: startupResultTasks,
+                tapInstalled: startupTapInstalled
+            )
+            if isStartupCurrent(generation) {
+                isRunning = false
+                lifecycleState = .idle
+            }
+            throw error
+        }
     }
 
     func stop() async {
-        guard isRunning || analyzer != nil else { return }
+        switch lifecycleState {
+        case .idle, .stopping:
+            return
+        case .starting, .running:
+            break
+        }
+
+        lifecycleGeneration += 1
+        let generation = lifecycleGeneration
+        lifecycleState = .stopping(generation)
         isRunning = false
-        audioEngine.inputNode.removeTap(onBus: 0)
+
+        let analyzer = self.analyzer
+        self.analyzer = nil
+        let captureContinuation = self.captureContinuation
+        self.captureContinuation = nil
+        let inputContinuation = self.inputContinuation
+        self.inputContinuation = nil
+        let feederTask = self.feederTask
+        self.feederTask = nil
+        let resultTasks = self.resultTasks
+        self.resultTasks.removeAll()
+
+        if isTapInstalled {
+            audioEngine.inputNode.removeTap(onBus: 0)
+            isTapInstalled = false
+        }
         audioEngine.stop()
         captureContinuation?.finish()
-        captureContinuation = nil
-        await feederTask?.value
-        feederTask = nil
-        inputContinuation = nil
+        if let feederTask {
+            await feederTask.value
+        } else {
+            inputContinuation?.finish()
+        }
 
         if let analyzer {
             try? await analyzer.finalizeAndFinishThroughEndOfInput()
         }
 
         for task in resultTasks {
-            task.cancel()
+            await task.value
         }
-        resultTasks.removeAll()
-        languageSelectionTask?.cancel()
+        if let languageSelectionTask {
+            await languageSelectionTask.value
+        }
         languageSelectionTask = nil
-        analyzer = nil
         japaneseTranscriber = nil
         englishTranscriber = nil
         audioConverter = nil
+        acceptedResultGeneration = nil
         speechArbiter.reset()
+        lastEmittedSignature = nil
+        if lifecycleState == .stopping(generation) {
+            lifecycleState = .idle
+        }
     }
 
-    private func reportAudioFeederFailure(_ error: Error) {
-        delegate?.localSpeechRecognitionService(self, didFail: error)
+    private func ensureStartupIsCurrent(_ generation: Int) throws {
+        try Task.checkCancellation()
+        guard isStartupCurrent(generation) else {
+            throw CancellationError()
+        }
+    }
+
+    private func isStartupCurrent(_ generation: Int) -> Bool {
+        lifecycleGeneration == generation
+            && lifecycleState == .starting(generation)
+    }
+
+    private func cleanUpFailedStart(
+        analyzer: SpeechAnalyzer?,
+        captureContinuation: AsyncStream<CapturedAudioBuffer>.Continuation?,
+        inputContinuation: AsyncStream<AnalyzerInput>.Continuation?,
+        feederTask: Task<Void, Never>?,
+        resultTasks: [Task<Void, Never>],
+        tapInstalled: Bool
+    ) async {
+        if tapInstalled {
+            audioEngine.inputNode.removeTap(onBus: 0)
+            audioEngine.stop()
+        }
+        captureContinuation?.finish()
+        feederTask?.cancel()
+        if let feederTask {
+            await feederTask.value
+        }
+        inputContinuation?.finish()
+        if let analyzer {
+            await analyzer.cancelAndFinishNow()
+        }
+        for task in resultTasks {
+            task.cancel()
+            await task.value
+        }
+    }
+
+    private func reportAudioFeederFailure(_ error: Error, generation: Int) {
+        guard case .running = lifecycleState,
+              acceptedResultGeneration == generation
+        else {
+            return
+        }
+        delegate?.localSpeechRecognitionService(didFail: error)
+    }
+
+    private func reportResultFailure(_ error: Error, generation: Int) {
+        guard case .running = lifecycleState,
+              acceptedResultGeneration == generation
+        else {
+            return
+        }
+        delegate?.localSpeechRecognitionService(didFail: error)
     }
 
     private func supportedLocale(identifier: String) async throws -> Locale {
@@ -343,39 +511,53 @@ final class LocalSpeechRecognitionService {
         )
     }
 
-    private func startResultTasks(
+    private func makeResultTasks(
         japaneseTranscriber: SpeechTranscriber,
-        englishTranscriber: SpeechTranscriber
-    ) {
-        resultTasks = [
+        englishTranscriber: SpeechTranscriber,
+        generation: Int
+    ) -> [Task<Void, Never>] {
+        [
             Task { [weak self] in
                 do {
                     for try await result in japaneseTranscriber.results {
-                        self?.handle(result: result, language: .japanese)
+                        self?.handle(
+                            result: result,
+                            language: .japanese,
+                            generation: generation
+                        )
                     }
                 } catch is CancellationError {
                     return
                 } catch {
                     guard let self else { return }
-                    self.delegate?.localSpeechRecognitionService(self, didFail: error)
+                    self.reportResultFailure(error, generation: generation)
                 }
             },
             Task { [weak self] in
                 do {
                     for try await result in englishTranscriber.results {
-                        self?.handle(result: result, language: .english)
+                        self?.handle(
+                            result: result,
+                            language: .english,
+                            generation: generation
+                        )
                     }
                 } catch is CancellationError {
                     return
                 } catch {
                     guard let self else { return }
-                    self.delegate?.localSpeechRecognitionService(self, didFail: error)
+                    self.reportResultFailure(error, generation: generation)
                 }
             },
         ]
     }
 
-    private func handle(result: SpeechTranscriber.Result, language: SpokenLanguage) {
+    private func handle(
+        result: SpeechTranscriber.Result,
+        language: SpokenLanguage,
+        generation: Int
+    ) {
+        guard acceptedResultGeneration == generation else { return }
         let text = String(result.text.characters).trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return }
 
@@ -426,7 +608,6 @@ final class LocalSpeechRecognitionService {
         lastEmittedSignature = signature
 
         delegate?.localSpeechRecognitionService(
-            self,
             didUpdate: candidate.text,
             language: candidate.language,
             isFinal: candidate.isFinal

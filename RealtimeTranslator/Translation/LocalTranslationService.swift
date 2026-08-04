@@ -140,7 +140,16 @@ private final class TranslationLane {
 }
 
 @MainActor
-final class LocalTranslationService {
+protocol LocalTranslationServicing: AnyObject {
+    func translate(
+        _ text: String,
+        from language: SpokenLanguage,
+        priority: LocalTranslationPriority
+    ) async throws -> String
+}
+
+@MainActor
+final class LocalTranslationService: LocalTranslationServicing {
     private let jaToEnLane = TranslationLane()
     private let enToJaLane = TranslationLane()
 

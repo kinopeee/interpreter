@@ -69,8 +69,25 @@ struct SpeechRecognitionCandidate: Equatable, Sendable {
 }
 
 struct BilingualSpeechArbiter: Sendable {
+    private struct FinalizedRange: Sendable {
+        let startTime: Double
+        let endTime: Double
+
+        func substantiallyOverlaps(_ candidate: SpeechRecognitionCandidate) -> Bool {
+            let intersectionStart = max(startTime, candidate.startTime)
+            let intersectionEnd = min(endTime, candidate.endTime)
+            let intersection = max(0, intersectionEnd - intersectionStart)
+            let finalizedDuration = max(0.001, endTime - startTime)
+            let candidateDuration = max(0.001, candidate.endTime - candidate.startTime)
+            let shorterDuration = min(finalizedDuration, candidateDuration)
+            return intersection / shorterDuration >= 0.5
+                || abs(startTime - candidate.startTime) < 0.1
+        }
+    }
+
     private(set) var activeLanguage: SpokenLanguage?
     private var candidates: [SpokenLanguage: SpeechRecognitionCandidate] = [:]
+    private var finalizedRanges: [FinalizedRange] = []
 
     var hasPendingCandidates: Bool {
         !candidates.isEmpty
@@ -79,15 +96,20 @@ struct BilingualSpeechArbiter: Sendable {
     mutating func reset() {
         activeLanguage = nil
         candidates.removeAll(keepingCapacity: true)
+        finalizedRanges.removeAll(keepingCapacity: true)
     }
 
     mutating func submit(
         _ candidate: SpeechRecognitionCandidate
     ) -> SpeechRecognitionCandidate? {
+        guard !finalizedRanges.contains(where: { $0.substantiallyOverlaps(candidate) }) else {
+            return nil
+        }
+
         if let activeLanguage {
             guard candidate.language == activeLanguage else { return nil }
             if candidate.isFinal {
-                reset()
+                completeRange(candidate)
             }
             return candidate
         }
@@ -111,8 +133,19 @@ struct BilingualSpeechArbiter: Sendable {
         }
         activeLanguage = winner.language
         if winner.isFinal {
-            reset()
+            completeRange(winner)
         }
         return winner
+    }
+
+    private mutating func completeRange(_ candidate: SpeechRecognitionCandidate) {
+        finalizedRanges.append(
+            FinalizedRange(
+                startTime: candidate.startTime,
+                endTime: candidate.endTime
+            )
+        )
+        activeLanguage = nil
+        candidates.removeAll(keepingCapacity: true)
     }
 }
