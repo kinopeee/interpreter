@@ -4,8 +4,6 @@ struct SubtitleAggregatorConfig: Sendable {
     var idleFinalizeInterval: TimeInterval = 1.0
     var maxJapaneseCharacters = 60
     var maxEnglishCharacters = 120
-    var previousHoldInterval: TimeInterval = 5.0
-    var fadeDuration: TimeInterval = 0.3
 }
 
 final class SubtitleAggregator: @unchecked Sendable {
@@ -13,14 +11,7 @@ final class SubtitleAggregator: @unchecked Sendable {
     private let lock = NSLock()
 
     private var current = LiveSubtitle.empty
-    private var previous: LiveSubtitle?
-    private var previousFinalizedAt: Date?
-    /// currentスロットにその場確定(in-place)したペアを置いた時刻。
-    /// 視線位置を動かさないため、確定ペアは次の発話開始か保持時間経過まで
-    /// currentスロットに残し、その後previousへ退避させる。
-    private var currentFinalizedAt: Date?
     private var statusBanner: String?
-    private var previousOpacity: Double = 1
 
     init(config: SubtitleAggregatorConfig = SubtitleAggregatorConfig()) {
         self.config = config
@@ -30,11 +21,7 @@ final class SubtitleAggregator: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         current = .empty
-        previous = nil
-        previousFinalizedAt = nil
-        currentFinalizedAt = nil
         statusBanner = nil
-        previousOpacity = 1
     }
 
     func setStatusBanner(_ message: String?) {
@@ -53,7 +40,7 @@ final class SubtitleAggregator: @unchecked Sendable {
     ) -> SubtitleSnapshot {
         lock.lock()
         defer { lock.unlock() }
-        promoteInPlaceFinalizedLocked(now: now)
+        // 履歴なし: 確定済みでも次の発話でそのまま上書きする。
         current = LiveSubtitle(
             sourceText: sourceText,
             translatedText: translatedText,
@@ -70,7 +57,17 @@ final class SubtitleAggregator: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         guard !delta.isEmpty else { return snapshotLocked() }
-        promoteInPlaceFinalizedLocked(now: now)
+        if current.state == .finalized {
+            current = LiveSubtitle(
+                sourceText: delta,
+                translatedText: "",
+                lastUpdatedAt: now,
+                state: .live,
+                isTranslationCurrent: false,
+                canFinalize: false
+            )
+            return snapshotLocked()
+        }
         current.sourceText += delta
         current.isTranslationCurrent = false
         current.canFinalize = false
@@ -99,7 +96,6 @@ final class SubtitleAggregator: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         finalizeIfNeededLocked(now: now)
-        updatePreviousOpacityLocked(now: now)
         return snapshotLocked()
     }
 
@@ -108,11 +104,11 @@ final class SubtitleAggregator: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         if hasCompletePair(current) {
-            promoteCurrentLocked(now: now)
+            current.state = .finalized
+            current.lastUpdatedAt = now
         } else {
             clearCurrentLocked(now: now)
         }
-        updatePreviousOpacityLocked(now: now)
         return snapshotLocked()
     }
 
@@ -138,36 +134,23 @@ final class SubtitleAggregator: @unchecked Sendable {
         }
 
         if clearCurrent {
-            // このペアが現在の発話そのもの(次の発話がまだ来ていない)場合は、
-            // 読者の視線位置を動かさないためcurrentスロットにその場確定で残す。
-            // previousへの退避は次の発話開始時か保持時間経過時に行う。
-            promoteInPlaceFinalizedLocked(now: now)
+            // このペアが現在の発話そのものなら、視線を動かさないためcurrentに残す。
+            // 次の発話開始(replaceCurrent)まで保持し、タイマーでは消さない。
             current = finalized
-            currentFinalizedAt = now
-        } else {
-            previous = finalized
-            previousFinalizedAt = now
-            previousOpacity = 1
         }
-        updatePreviousOpacityLocked(now: now)
+        // clearCurrent == false: 次発話が既にcurrentを占めている。履歴がないため破棄する。
         return snapshotLocked()
     }
 
     func snapshot(now: Date = Date()) -> SubtitleSnapshot {
         lock.lock()
         defer { lock.unlock() }
-        updatePreviousOpacityLocked(now: now)
         return snapshotLocked()
     }
 
     private func finalizeIfNeededLocked(now: Date) {
         guard !current.isEmpty else { return }
-
-        if current.state == .finalized {
-            expireInPlaceFinalizedIfNeededLocked(now: now)
-            return
-        }
-
+        guard current.state != .finalized else { return }
         guard hasCompletePair(current) else { return }
 
         let idleExpired = now.timeIntervalSince(current.lastUpdatedAt) >= config.idleFinalizeInterval
@@ -178,23 +161,12 @@ final class SubtitleAggregator: @unchecked Sendable {
             || exceedsMaxLength(current.translatedText, japanesePreferred: false)
 
         if punctuation || idleExpired || tooLong {
-            promoteCurrentLocked(now: now)
+            current.state = .finalized
+            current.lastUpdatedAt = now
         }
     }
 
-    private func promoteCurrentLocked(now: Date) {
-        guard hasCompletePair(current) else { return }
-        var finalized = current
-        finalized.state = .finalized
-        finalized.lastUpdatedAt = now
-        previous = finalized
-        previousFinalizedAt = now
-        previousOpacity = 1
-        clearCurrentLocked(now: now)
-    }
-
     private func clearCurrentLocked(now: Date) {
-        currentFinalizedAt = nil
         current = LiveSubtitle(
             sourceText: "",
             translatedText: "",
@@ -205,29 +177,6 @@ final class SubtitleAggregator: @unchecked Sendable {
         )
     }
 
-    /// currentスロットのin-place確定ペアをpreviousへ退避する(次の発話が来た時)。
-    /// 読者が読み終えていない可能性があるため、previous側でフルの保持時間を与える。
-    private func promoteInPlaceFinalizedLocked(now: Date) {
-        guard currentFinalizedAt != nil, current.state == .finalized else { return }
-        previous = current
-        previousFinalizedAt = now
-        previousOpacity = 1
-        currentFinalizedAt = nil
-    }
-
-    /// in-place確定ペアが保持時間を超えたらpreviousへ退避する(発話が続かなかった時)。
-    /// 確定時刻を引き継ぐため、退避直後からprevious側のフェードが始まる。
-    private func expireInPlaceFinalizedIfNeededLocked(now: Date) {
-        guard let currentFinalizedAt,
-              now.timeIntervalSince(currentFinalizedAt) >= config.previousHoldInterval
-        else {
-            return
-        }
-        previous = current
-        previousFinalizedAt = currentFinalizedAt
-        clearCurrentLocked(now: now)
-    }
-
     private func hasCompletePair(_ subtitle: LiveSubtitle) -> Bool {
         !subtitle.sourceText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             && !subtitle.translatedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
@@ -235,42 +184,10 @@ final class SubtitleAggregator: @unchecked Sendable {
             && subtitle.canFinalize
     }
 
-    private func updatePreviousOpacityLocked(now: Date) {
-        guard let previousFinalizedAt else {
-            previousOpacity = 1
-            return
-        }
-        let elapsed = now.timeIntervalSince(previousFinalizedAt)
-        if elapsed < config.previousHoldInterval {
-            previousOpacity = 1
-            if var previous {
-                previous.state = .finalized
-                self.previous = previous
-            }
-            return
-        }
-
-        let fadeElapsed = elapsed - config.previousHoldInterval
-        if fadeElapsed >= config.fadeDuration {
-            previous = nil
-            self.previousFinalizedAt = nil
-            previousOpacity = 0
-            return
-        }
-
-        previousOpacity = max(0, 1 - (fadeElapsed / config.fadeDuration))
-        if var previous {
-            previous.state = .fading
-            self.previous = previous
-        }
-    }
-
     private func snapshotLocked() -> SubtitleSnapshot {
         SubtitleSnapshot(
             current: current,
-            previous: previous,
-            statusBanner: statusBanner,
-            previousOpacity: previousOpacity
+            statusBanner: statusBanner
         )
     }
 

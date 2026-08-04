@@ -43,9 +43,7 @@ final class AppCoordinator: NSObject {
     private var idleSnapshot: SubtitleSnapshot {
         SubtitleSnapshot(
             current: .empty,
-            previous: nil,
-            statusBanner: "待機中 — 「録音開始」を押してください",
-            previousOpacity: 1
+            statusBanner: "待機中 — 「録音開始」を押してください"
         )
     }
 
@@ -136,7 +134,7 @@ extension AppCoordinator: InterpretationSessionDelegate {
         translationState = state
         menuBarController.refresh()
         writeStatusFile(state.rawValue)
-        if state == .idle, lastSnapshot.current.isEmpty, lastSnapshot.previous == nil {
+        if state == .idle, lastSnapshot.current.isEmpty {
             lastSnapshot = idleSnapshot
         }
         subtitleWindow.update(
@@ -153,7 +151,6 @@ extension AppCoordinator: InterpretationSessionDelegate {
         let displayedSnapshot: SubtitleSnapshot
         if translationState == .idle,
            snapshot.current.isEmpty,
-           snapshot.previous == nil,
            snapshot.statusBanner == nil
         {
             displayedSnapshot = idleSnapshot

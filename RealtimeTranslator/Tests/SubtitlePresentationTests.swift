@@ -62,25 +62,6 @@ final class SubtitlePresentationTests: XCTestCase {
         XCTAssertNotEqual(first.presentation, second.presentation)
     }
 
-    func testPreviousFadeOpacityChangeChangesPresentation() {
-        // Given: 表示文字が同じで前文のfade値だけが異なるsnapshot
-        let previous = subtitle(source: "前文", translation: "Previous")
-        let first = snapshot(
-            current: .empty,
-            previous: previous,
-            previousOpacity: 1
-        )
-        let second = snapshot(
-            current: .empty,
-            previous: previous,
-            previousOpacity: 0.5
-        )
-
-        // When: 表示状態を比較する
-        // Then: 意図したfadeは再描画対象にする
-        XCTAssertNotEqual(first.presentation, second.presentation)
-    }
-
     func testTranslationFreshnessDoesNotChangeVisibleOpacity() {
         // Given: 同じ非空訳文を持つ更新待ち字幕と最新字幕
         let stale = subtitle(
@@ -115,16 +96,13 @@ final class SubtitlePresentationTests: XCTestCase {
     }
 
     func testTextLayoutUsesCompactLimitsAndKeepsSentenceEnd() {
-        // Given: 行数を超える現在文と前文を同時に表示する字幕
-        // When: 各ブロックの最大行数と省略位置の設定を確認する
+        // Given: 行数を超える現在文を表示する字幕
+        // When: 最大行数と省略位置の設定を確認する
         let currentLineLimit = SubtitleTextLayout.currentLineLimit
-        let previousLineLimit = SubtitleTextLayout.previousLineLimit
         let truncationMode = SubtitleTextLayout.truncationMode
 
-        // Then: 行数を抑えつつ文頭を省略し、必要な文末を残す。前文も英文が収まる2行を確保する
+        // Then: 行数を抑えつつ文頭を省略し、必要な文末を残す
         XCTAssertEqual(currentLineLimit, 2)
-        XCTAssertEqual(previousLineLimit, 2)
-        XCTAssertLessThan(SubtitleVisualStyle.previousBlockOpacity, 1)
         XCTAssertEqual(truncationMode, .head)
     }
 
@@ -155,32 +133,6 @@ final class SubtitlePresentationTests: XCTestCase {
 
         // Then: 固定スロットにより長文でも短文と同じ高さに留まる
         XCTAssertEqual(longHeight, shortHeight, accuracy: 0.5)
-    }
-
-    func testPreviousPresenceIncreasesMeasuredHeight() {
-        // Given: 前文なしの現在字幕と、前文ありの現在字幕
-        let withoutPrevious = SubtitleView(
-            snapshot: snapshot(
-                current: subtitle(source: "現在の原文", translation: "Current translation")
-            ),
-            fontSize: 32,
-            isEditingPosition: false
-        )
-        let withPrevious = SubtitleView(
-            snapshot: snapshot(
-                current: subtitle(source: "現在の原文", translation: "Current translation"),
-                previous: subtitle(source: "前文の原文", translation: "Previous translation")
-            ),
-            fontSize: 32,
-            isEditingPosition: false
-        )
-
-        // When: 同じ幅で固有高を計測する
-        let withoutHeight = measuredHeight(of: withoutPrevious, width: 600)
-        let withHeight = measuredHeight(of: withPrevious, width: 600)
-
-        // Then: 空の前文は待機中に畳み、録音ボタンがバナー直下へ来るようにする
-        XCTAssertGreaterThan(withHeight, withoutHeight + 20)
     }
 
     func testEmptyCurrentDoesNotChangeMeasuredHeight() {
@@ -352,15 +304,11 @@ final class SubtitlePresentationTests: XCTestCase {
 
     private func snapshot(
         current: LiveSubtitle,
-        previous: LiveSubtitle? = nil,
-        statusBanner: String? = nil,
-        previousOpacity: Double = 1
+        statusBanner: String? = nil
     ) -> SubtitleSnapshot {
         SubtitleSnapshot(
             current: current,
-            previous: previous,
-            statusBanner: statusBanner,
-            previousOpacity: previousOpacity
+            statusBanner: statusBanner
         )
     }
 

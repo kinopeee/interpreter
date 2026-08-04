@@ -3,7 +3,6 @@ import Foundation
 enum SubtitleBlockState: String, Sendable, Equatable {
     case live
     case finalized
-    case fading
 }
 
 struct LiveSubtitle: Equatable, Sendable {
@@ -31,23 +30,17 @@ struct LiveSubtitle: Equatable, Sendable {
 
 struct SubtitleSnapshot: Equatable, Sendable {
     var current: LiveSubtitle
-    var previous: LiveSubtitle?
     var statusBanner: String?
-    var previousOpacity: Double
 
     static let empty = SubtitleSnapshot(
         current: .empty,
-        previous: nil,
-        statusBanner: nil,
-        previousOpacity: 1
+        statusBanner: nil
     )
 
     var presentation: SubtitlePresentation {
         SubtitlePresentation(
             current: SubtitlePresentation.Block(current),
-            previous: previous.map(SubtitlePresentation.Block.init),
-            statusBanner: statusBanner,
-            previousOpacity: previousOpacity
+            statusBanner: statusBanner
         )
     }
 }
@@ -64,7 +57,5 @@ struct SubtitlePresentation: Equatable, Sendable {
     }
 
     let current: Block
-    let previous: Block?
     let statusBanner: String?
-    let previousOpacity: Double
 }

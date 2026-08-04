@@ -102,7 +102,6 @@ final class InterpretationSession {
     private let maxFinalTranslationAttempts: Int
     private let finalTranslationRetryDelayNanoseconds: UInt64
     private let activeTickerIntervalNanoseconds: UInt64
-    private let idleTickerIntervalNanoseconds: UInt64
     /// live訳文を一度表示したら次の書き換えまで最低これだけ保持する。
     /// 読んでいる最中に訳文全体が語順ごと書き換わるちらつきを抑える。
     /// 確定訳(final)の表示には適用しない。
@@ -141,7 +140,6 @@ final class InterpretationSession {
         maxFinalTranslationAttempts: Int = 5,
         finalTranslationRetryDelayNanoseconds: UInt64 = 250_000_000,
         activeTickerIntervalNanoseconds: UInt64 = 200_000_000,
-        idleTickerIntervalNanoseconds: UInt64 = 200_000_000,
         liveTranslationDisplayHoldNanoseconds: UInt64 = 1_500_000_000
     ) {
         precondition(maxPendingFinalTranslations > 0)
@@ -153,7 +151,6 @@ final class InterpretationSession {
         self.maxFinalTranslationAttempts = maxFinalTranslationAttempts
         self.finalTranslationRetryDelayNanoseconds = finalTranslationRetryDelayNanoseconds
         self.activeTickerIntervalNanoseconds = activeTickerIntervalNanoseconds
-        self.idleTickerIntervalNanoseconds = idleTickerIntervalNanoseconds
         self.liveTranslationDisplayHoldInterval =
             TimeInterval(liveTranslationDisplayHoldNanoseconds) / 1_000_000_000
         speechService.delegate = self
@@ -227,11 +224,8 @@ final class InterpretationSession {
         aggregator.setStatusBanner(nil)
         state = .idle
         publishSubtitles()
-        if snapshot.previous == nil {
-            stopTicker()
-        } else {
-            startTicker(intervalNanoseconds: idleTickerIntervalNanoseconds)
-        }
+        // 確定字幕は次の発話開始(または再録音)まで残す。タイマー消去はしない。
+        stopTicker()
     }
 
     /// 発話途中の一時的な処理(表示スロットリング待ちの原文とlive翻訳)を打ち切る。
@@ -507,10 +501,7 @@ final class InterpretationSession {
                 guard !Task.isCancelled else { return }
                 let snapshot = self.aggregator.tick()
                 self.delegate?.interpretationSession(self, didUpdateSubtitles: snapshot)
-                if (self.state == .idle || self.state == .error),
-                   snapshot.current.isEmpty,
-                   snapshot.previous == nil
-                {
+                if self.state == .idle || self.state == .error {
                     self.tickerTask = nil
                     return
                 }

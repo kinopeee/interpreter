@@ -14,7 +14,7 @@
 - `Audio/SpokenLanguage.swift`: 言語判定と文単位のレーン固定。
 - `Translation/LocalTranslationService.swift`: SwiftUI `translationTask`に結び付いた2方向のApple Translation。
 - `Realtime/InterpretationSession.swift`: 認識、表示スロットリング、翻訳、状態遷移を統合。
-- `Subtitles/`: current/previous字幕集約、透明オーバーレイ、録音コントロール。
+- `Subtitles/`: 単一current字幕集約、透明オーバーレイ、録音コントロール。
 - `project.yml`: XcodeGen設定、Info.plist項目、権限説明の正本。
 
 ## 並行処理
@@ -45,10 +45,10 @@
 - 字幕本文パネルはクリック透過、録音ボタンの別パネルだけを操作可能にする。
 - `.floating`、`.canJoinAllSpaces`、`.fullScreenAuxiliary`を維持し、他アプリやフルスクリーン上の表示を壊さない。
 - スライドを隠す全面黒背景へ戻さない。文字周辺の薄い背景と黒いハローで可読性を確保する。
-- currentとpreviousを分離し、原文だけを確定しない。
+- 字幕は単一のcurrentスロットのみ。確定ペアもその場に残し、次発話開始で上書きする（履歴ブロックなし、タイマー消去なし）。原文だけを確定しない。
 - 更新待ちの旧訳文は`isTranslationCurrent = false`かつ`canFinalize = false`にする。
 - 発話途中の原文表示は約160ms間隔に抑え、行高を維持してちらつきを防ぐ。
-- パネル高は複数行の2ブロックを収め、下段のベースラインをクリップしない。
+- パネル高は複数行の1ブロックを収め、ベースラインをクリップしない。
 
 ## プロジェクト設定
 

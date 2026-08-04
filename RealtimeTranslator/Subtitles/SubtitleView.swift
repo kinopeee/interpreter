@@ -2,30 +2,15 @@ import SwiftUI
 
 enum SubtitleTextLayout {
     static let currentLineLimit = 2
-    // Two lines so finalized English sentences survive head truncation.
-    static let previousLineLimit = 2
     static let truncationMode: Text.TruncationMode = .head
 }
 
 enum SubtitleVisualStyle {
-    static let previousBlockOpacity = 0.6
     static let sourceTextOpacity = 0.7
     static let visibleTranslatedTextOpacity = 1.0
 
     static func translatedTextOpacity(for subtitle: LiveSubtitle) -> Double {
         subtitle.translatedText.isEmpty ? 0 : visibleTranslatedTextOpacity
-    }
-
-    static func blockOpacity(
-        isPrevious: Bool,
-        previousOpacity: Double,
-        isEmpty: Bool
-    ) -> Double {
-        guard !isEmpty else { return 0 }
-        if isPrevious {
-            return previousBlockOpacity * previousOpacity
-        }
-        return 1
     }
 }
 
@@ -36,20 +21,8 @@ struct SubtitleView: View {
 
     var body: some View {
         // Banner is last so idle prompts sit next to the control panel under the
-        // subtitle window. Empty previous is omitted so standby does not leave a
-        // tall transparent gap that pushes 「録音開始」 out of view.
+        // subtitle window.
         VStack(alignment: .leading, spacing: 8) {
-            if let previous = snapshot.previous, !previous.isEmpty {
-                subtitleBlock(previous, isPrevious: true)
-                    .opacity(
-                        SubtitleVisualStyle.blockOpacity(
-                            isPrevious: true,
-                            previousOpacity: snapshot.previousOpacity,
-                            isEmpty: false
-                        )
-                    )
-            }
-
             currentSlot
 
             if let banner = trimmedStatusBanner {
@@ -103,14 +76,8 @@ struct SubtitleView: View {
         let showListeningPlaceholder = snapshot.current.isEmpty
             && (snapshot.statusBanner == nil || snapshot.statusBanner?.isEmpty == true)
 
-        return subtitleBlock(snapshot.current, isPrevious: false)
-            .opacity(
-                SubtitleVisualStyle.blockOpacity(
-                    isPrevious: false,
-                    previousOpacity: 1,
-                    isEmpty: snapshot.current.isEmpty
-                )
-            )
+        return subtitleBlock(snapshot.current)
+            .opacity(snapshot.current.isEmpty ? 0 : 1)
             .accessibilityHidden(snapshot.current.isEmpty)
             .overlay(alignment: .leading) {
                 if showListeningPlaceholder {
@@ -124,13 +91,7 @@ struct SubtitleView: View {
     }
 
     @ViewBuilder
-    private func subtitleBlock(
-        _ subtitle: LiveSubtitle,
-        isPrevious: Bool
-    ) -> some View {
-        let lineLimit = isPrevious
-            ? SubtitleTextLayout.previousLineLimit
-            : SubtitleTextLayout.currentLineLimit
+    private func subtitleBlock(_ subtitle: LiveSubtitle) -> some View {
         let sourceText = subtitle.sourceText.isEmpty ? " " : subtitle.sourceText
         let translatedText = subtitle.translatedText.isEmpty ? " " : subtitle.translatedText
 
@@ -143,7 +104,7 @@ struct SubtitleView: View {
                     )
                 )
                 .foregroundStyle(Color.white.opacity(SubtitleVisualStyle.sourceTextOpacity))
-                .lineLimit(lineLimit, reservesSpace: true)
+                .lineLimit(SubtitleTextLayout.currentLineLimit, reservesSpace: true)
                 .truncationMode(SubtitleTextLayout.truncationMode)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .subtitleHalo()
@@ -153,7 +114,7 @@ struct SubtitleView: View {
             Text(translatedText)
                 .font(.system(size: fontSize, weight: .semibold))
                 .foregroundStyle(.white)
-                .lineLimit(lineLimit, reservesSpace: true)
+                .lineLimit(SubtitleTextLayout.currentLineLimit, reservesSpace: true)
                 .truncationMode(SubtitleTextLayout.truncationMode)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .subtitleHalo()
