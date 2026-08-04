@@ -150,6 +150,64 @@ final class InterpretationSessionTests: XCTestCase {
         await session.stop()
     }
 
+    func testTransientFinalTranslationFailureRetriesAndFinalizes() async throws {
+        // Given: 確定翻訳が2回だけ準備失敗し、3回目で成功するセッション
+        let speechService = FakeSpeechRecognitionService()
+        let translationService = FakeTranslationService()
+        translationService.translations["文A"] = "Sentence A"
+        translationService.finalFailureCounts["文A"] = 2
+        let delegate = InterpretationSessionDelegateSpy()
+        let session = InterpretationSession(
+            translationService: translationService,
+            speechService: speechService,
+            maxFinalTranslationAttempts: 5,
+            finalTranslationRetryDelayNanoseconds: 0
+        )
+        session.delegate = delegate
+        await session.start()
+
+        // When: 確定文Aを1件だけキューへ入れる
+        speechService.emit(text: "文A", language: .japanese, isFinal: true)
+        await delegate.waitUntilPreviousSource("文A")
+
+        // Then: 一時失敗後も同じ確定文を再試行し、原文・訳文ペアを失わない
+        XCTAssertEqual(translationService.finalRequests, ["文A", "文A", "文A"])
+        let snapshot = try XCTUnwrap(delegate.lastSnapshot)
+        XCTAssertEqual(snapshot.previous?.sourceText, "文A")
+        XCTAssertEqual(snapshot.previous?.translatedText, "Sentence A")
+        XCTAssertTrue(snapshot.current.isEmpty)
+        await session.stop()
+    }
+
+    func testFinalTranslationFailureEventuallyGivesUpWithoutBlockingNext() async throws {
+        // Given: 文Aの確定翻訳が常に失敗し、文Bは成功するセッション
+        let speechService = FakeSpeechRecognitionService()
+        let translationService = FakeTranslationService()
+        translationService.translations["文B"] = "Sentence B"
+        translationService.finalFailureCounts["文A"] = 100
+        let delegate = InterpretationSessionDelegateSpy()
+        let session = InterpretationSession(
+            translationService: translationService,
+            speechService: speechService,
+            maxFinalTranslationAttempts: 2,
+            finalTranslationRetryDelayNanoseconds: 0
+        )
+        session.delegate = delegate
+        await session.start()
+
+        // When: 失敗し続ける文Aのあとに文Bを確定する
+        speechService.emit(text: "文A", language: .japanese, isFinal: true)
+        speechService.emit(text: "文B", language: .japanese, isFinal: true)
+        await delegate.waitUntilPreviousSource("文B")
+
+        // Then: 文Aは再試行上限で打ち切り、文Bの確定を阻害しない
+        XCTAssertEqual(translationService.finalRequests, ["文A", "文A", "文B"])
+        let snapshot = try XCTUnwrap(delegate.lastSnapshot)
+        XCTAssertEqual(snapshot.previous?.sourceText, "文B")
+        XCTAssertEqual(snapshot.previous?.translatedText, "Sentence B")
+        await session.stop()
+    }
+
     func testEmptyRecognitionRetractsCurrentWithoutTranslation() async {
         // Given: 日本語の暫定字幕を表示し、翻訳debounce中のセッション
         let speechService = FakeSpeechRecognitionService()
@@ -536,6 +594,7 @@ private final class FakeTranslationService: LocalTranslationServicing {
     var suspendedLiveTexts: Set<String> = []
     var suspendedFinalTexts: Set<String> = []
     var cancelledFinalTexts: Set<String> = []
+    var finalFailureCounts: [String: Int] = [:]
     private(set) var finalRequests: [String] = []
     private(set) var liveRequests: [String] = []
     private var liveContinuations: [String: CheckedContinuation<String, Error>] = [:]
@@ -569,6 +628,10 @@ private final class FakeTranslationService: LocalTranslationServicing {
             }
             if cancelledFinalTexts.contains(text) {
                 throw CancellationError()
+            }
+            if let remainingFailures = finalFailureCounts[text], remainingFailures > 0 {
+                finalFailureCounts[text] = remainingFailures - 1
+                throw LocalTranslationError.sessionUnavailable
             }
             if suspendedFinalTexts.contains(text) {
                 return try await withCheckedThrowingContinuation { continuation in
