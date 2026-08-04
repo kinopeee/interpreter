@@ -2,10 +2,9 @@ import SwiftUI
 
 enum SubtitleTextLayout {
     static let currentLineLimit = 2
-    static let previousLineLimit = 1
+    // Two lines so finalized English sentences survive head truncation.
+    static let previousLineLimit = 2
     static let truncationMode: Text.TruncationMode = .head
-    /// Approximate intrinsic size of `ProgressView().controlSize(.small)` for empty-slot reserve.
-    static let bannerSpinnerSide: CGFloat = 16
 }
 
 enum SubtitleVisualStyle {
@@ -36,23 +35,26 @@ struct SubtitleView: View {
     let isEditingPosition: Bool
 
     var body: some View {
+        // Banner is last so idle prompts sit next to the control panel under the
+        // subtitle window. Empty previous is omitted so standby does not leave a
+        // tall transparent gap that pushes 「録音開始」 out of view.
         VStack(alignment: .leading, spacing: 8) {
-            statusBannerSlot
-
-            subtitleBlock(
-                snapshot.previous ?? .empty,
-                isPrevious: true
-            )
-            .opacity(
-                SubtitleVisualStyle.blockOpacity(
-                    isPrevious: true,
-                    previousOpacity: snapshot.previousOpacity,
-                    isEmpty: snapshot.previous?.isEmpty != false
-                )
-            )
-            .accessibilityHidden(snapshot.previous?.isEmpty != false)
+            if let previous = snapshot.previous, !previous.isEmpty {
+                subtitleBlock(previous, isPrevious: true)
+                    .opacity(
+                        SubtitleVisualStyle.blockOpacity(
+                            isPrevious: true,
+                            previousOpacity: snapshot.previousOpacity,
+                            isEmpty: false
+                        )
+                    )
+            }
 
             currentSlot
+
+            if let banner = trimmedStatusBanner {
+                statusBanner(banner)
+            }
         }
         .padding(.horizontal, 20)
         .padding(.top, 8)
@@ -74,26 +76,19 @@ struct SubtitleView: View {
         .multilineTextAlignment(.leading)
     }
 
-    private var statusBannerSlot: some View {
+    private var trimmedStatusBanner: String? {
         let banner = snapshot.statusBanner?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        let hasBanner = !banner.isEmpty
+        return banner.isEmpty ? nil : banner
+    }
 
-        return HStack(spacing: 8) {
-            // Keep the spinner out of the hierarchy when hidden so it does not keep animating.
-            if hasBanner {
-                ProgressView()
-                    .controlSize(.small)
-            } else {
-                Color.clear
-                    .frame(
-                        width: SubtitleTextLayout.bannerSpinnerSide,
-                        height: SubtitleTextLayout.bannerSpinnerSide
-                    )
-            }
-            Text(hasBanner ? banner : " ")
+    private func statusBanner(_ banner: String) -> some View {
+        HStack(spacing: 8) {
+            ProgressView()
+                .controlSize(.small)
+            Text(banner)
                 .font(.system(size: max(14, fontSize * 0.45), weight: .semibold))
                 .foregroundStyle(Color.yellow.opacity(0.95))
-                .lineLimit(1, reservesSpace: true)
+                .lineLimit(1)
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 7)
@@ -102,8 +97,6 @@ struct SubtitleView: View {
                 .fill(Color.black.opacity(0.46))
         )
         .shadow(color: .black.opacity(0.7), radius: 5, y: 2)
-        .opacity(hasBanner ? 1 : 0)
-        .accessibilityHidden(!hasBanner)
     }
 
     private var currentSlot: some View {

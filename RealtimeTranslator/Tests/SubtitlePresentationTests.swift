@@ -121,9 +121,9 @@ final class SubtitlePresentationTests: XCTestCase {
         let previousLineLimit = SubtitleTextLayout.previousLineLimit
         let truncationMode = SubtitleTextLayout.truncationMode
 
-        // Then: 行数を抑えつつ文頭を省略し、必要な文末を残す。前文は縮小せず不透明度で区別する
+        // Then: 行数を抑えつつ文頭を省略し、必要な文末を残す。前文も英文が収まる2行を確保する
         XCTAssertEqual(currentLineLimit, 2)
-        XCTAssertEqual(previousLineLimit, 1)
+        XCTAssertEqual(previousLineLimit, 2)
         XCTAssertLessThan(SubtitleVisualStyle.previousBlockOpacity, 1)
         XCTAssertEqual(truncationMode, .head)
     }
@@ -157,7 +157,7 @@ final class SubtitlePresentationTests: XCTestCase {
         XCTAssertEqual(longHeight, shortHeight, accuracy: 0.5)
     }
 
-    func testPreviousPresenceDoesNotChangeMeasuredHeight() {
+    func testPreviousPresenceIncreasesMeasuredHeight() {
         // Given: 前文なしの現在字幕と、前文ありの現在字幕
         let withoutPrevious = SubtitleView(
             snapshot: snapshot(
@@ -179,8 +179,8 @@ final class SubtitlePresentationTests: XCTestCase {
         let withoutHeight = measuredHeight(of: withoutPrevious, width: 600)
         let withHeight = measuredHeight(of: withPrevious, width: 600)
 
-        // Then: 前文スロットは常に確保され、視線位置が縦に動かない
-        XCTAssertEqual(withHeight, withoutHeight, accuracy: 0.5)
+        // Then: 空の前文は待機中に畳み、録音ボタンがバナー直下へ来るようにする
+        XCTAssertGreaterThan(withHeight, withoutHeight + 20)
     }
 
     func testEmptyCurrentDoesNotChangeMeasuredHeight() {
@@ -206,7 +206,34 @@ final class SubtitlePresentationTests: XCTestCase {
         XCTAssertEqual(emptyHeight, withHeight, accuracy: 0.5)
     }
 
-    func testStatusBannerPresenceDoesNotChangeMeasuredHeight() {
+    func testIdleBannerSitsBelowReservedCurrentSlot() {
+        // Given: 待機バナーだけの字幕と、同じバナーに現在字幕を足したビュー
+        let idleOnly = SubtitleView(
+            snapshot: snapshot(
+                current: .empty,
+                statusBanner: "待機中 — 「録音開始」を押してください"
+            ),
+            fontSize: 32,
+            isEditingPosition: false
+        )
+        let withCurrent = SubtitleView(
+            snapshot: snapshot(
+                current: subtitle(source: "現在の原文", translation: "Current translation"),
+                statusBanner: "待機中 — 「録音開始」を押してください"
+            ),
+            fontSize: 32,
+            isEditingPosition: false
+        )
+
+        // When: 同じ幅で固有高を計測する
+        let idleHeight = measuredHeight(of: idleOnly, width: 600)
+        let withCurrentHeight = measuredHeight(of: withCurrent, width: 600)
+
+        // Then: currentスロットは確保したまま、バナーはその下（操作パネル側）に付く
+        XCTAssertEqual(idleHeight, withCurrentHeight, accuracy: 0.5)
+    }
+
+    func testStatusBannerPresenceIncreasesMeasuredHeight() {
         // Given: バナーなしの字幕と、同じ本文でバナーありの字幕
         let withoutBanner = SubtitleView(
             snapshot: snapshot(
@@ -228,9 +255,8 @@ final class SubtitlePresentationTests: XCTestCase {
         let withoutHeight = measuredHeight(of: withoutBanner, width: 600)
         let withHeight = measuredHeight(of: withBanner, width: 600)
 
-        // Then: バナースロットは常に確保され、ProgressView有無で高さが変わらない
-        XCTAssertEqual(withHeight, withoutHeight, accuracy: 0.5)
-        XCTAssertEqual(SubtitleTextLayout.bannerSpinnerSide, 16, accuracy: 0.5)
+        // Then: バナーは表示時だけ高さを取り、非表示時は操作パネルとの隙間を空けない
+        XCTAssertGreaterThan(withHeight, withoutHeight + 10)
     }
 
     func testControllerKeepsLongSubtitlePanelInsideScreen() throws {
