@@ -273,8 +273,12 @@ final class SubtitleWindowController: NSObject {
     }
 
     private func apply(_ layout: SubtitleWindowLayout) {
-        panel.setFrame(layout.subtitleFrame, display: true)
-        controlPanel.setFrame(layout.controlFrame, display: true)
+        if panel.frame != layout.subtitleFrame {
+            panel.setFrame(layout.subtitleFrame, display: true)
+        }
+        if controlPanel.frame != layout.controlFrame {
+            controlPanel.setFrame(layout.controlFrame, display: true)
+        }
     }
 
     private static func initialLayout(

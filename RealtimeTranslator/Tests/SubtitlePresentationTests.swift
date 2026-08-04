@@ -121,10 +121,10 @@ final class SubtitlePresentationTests: XCTestCase {
         let previousLineLimit = SubtitleTextLayout.previousLineLimit
         let truncationMode = SubtitleTextLayout.truncationMode
 
-        // Then: 行数を抑えつつ文頭を省略し、必要な文末を残す
+        // Then: 行数を抑えつつ文頭を省略し、必要な文末を残す。前文は縮小せず不透明度で区別する
         XCTAssertEqual(currentLineLimit, 2)
         XCTAssertEqual(previousLineLimit, 1)
-        XCTAssertLessThan(SubtitleTextLayout.previousFontScale, 1)
+        XCTAssertLessThan(SubtitleVisualStyle.previousBlockOpacity, 1)
         XCTAssertEqual(truncationMode, .head)
     }
 
@@ -153,9 +153,84 @@ final class SubtitlePresentationTests: XCTestCase {
         let shortHeight = measuredHeight(of: shortView, width: 600)
         let longHeight = measuredHeight(of: longView, width: 600)
 
-        // Then: 長文でも2行分を超えてパネルを縦に拡大しない
-        XCTAssertGreaterThan(longHeight, shortHeight)
-        XCTAssertLessThan(longHeight, shortHeight + 80)
+        // Then: 固定スロットにより長文でも短文と同じ高さに留まる
+        XCTAssertEqual(longHeight, shortHeight, accuracy: 0.5)
+    }
+
+    func testPreviousPresenceDoesNotChangeMeasuredHeight() {
+        // Given: 前文なしの現在字幕と、前文ありの現在字幕
+        let withoutPrevious = SubtitleView(
+            snapshot: snapshot(
+                current: subtitle(source: "現在の原文", translation: "Current translation")
+            ),
+            fontSize: 32,
+            isEditingPosition: false
+        )
+        let withPrevious = SubtitleView(
+            snapshot: snapshot(
+                current: subtitle(source: "現在の原文", translation: "Current translation"),
+                previous: subtitle(source: "前文の原文", translation: "Previous translation")
+            ),
+            fontSize: 32,
+            isEditingPosition: false
+        )
+
+        // When: 同じ幅で固有高を計測する
+        let withoutHeight = measuredHeight(of: withoutPrevious, width: 600)
+        let withHeight = measuredHeight(of: withPrevious, width: 600)
+
+        // Then: 前文スロットは常に確保され、視線位置が縦に動かない
+        XCTAssertEqual(withHeight, withoutHeight, accuracy: 0.5)
+    }
+
+    func testEmptyCurrentDoesNotChangeMeasuredHeight() {
+        // Given: 現在字幕ありと、現在字幕が空のビュー
+        let withCurrent = SubtitleView(
+            snapshot: snapshot(
+                current: subtitle(source: "現在の原文", translation: "Current translation")
+            ),
+            fontSize: 32,
+            isEditingPosition: false
+        )
+        let emptyCurrent = SubtitleView(
+            snapshot: snapshot(current: .empty),
+            fontSize: 32,
+            isEditingPosition: false
+        )
+
+        // When: 同じ幅で固有高を計測する
+        let withHeight = measuredHeight(of: withCurrent, width: 600)
+        let emptyHeight = measuredHeight(of: emptyCurrent, width: 600)
+
+        // Then: currentスロットは空でも高さを保ち、レイアウトが縮まない
+        XCTAssertEqual(emptyHeight, withHeight, accuracy: 0.5)
+    }
+
+    func testStatusBannerPresenceDoesNotChangeMeasuredHeight() {
+        // Given: バナーなしの字幕と、同じ本文でバナーありの字幕
+        let withoutBanner = SubtitleView(
+            snapshot: snapshot(
+                current: subtitle(source: "現在の原文", translation: "Current translation")
+            ),
+            fontSize: 32,
+            isEditingPosition: false
+        )
+        let withBanner = SubtitleView(
+            snapshot: snapshot(
+                current: subtitle(source: "現在の原文", translation: "Current translation"),
+                statusBanner: "モデルを準備中…"
+            ),
+            fontSize: 32,
+            isEditingPosition: false
+        )
+
+        // When: 同じ幅で固有高を計測する
+        let withoutHeight = measuredHeight(of: withoutBanner, width: 600)
+        let withHeight = measuredHeight(of: withBanner, width: 600)
+
+        // Then: バナースロットは常に確保され、ProgressView有無で高さが変わらない
+        XCTAssertEqual(withHeight, withoutHeight, accuracy: 0.5)
+        XCTAssertEqual(SubtitleTextLayout.bannerSpinnerSide, 16, accuracy: 0.5)
     }
 
     func testControllerKeepsLongSubtitlePanelInsideScreen() throws {
@@ -252,12 +327,13 @@ final class SubtitlePresentationTests: XCTestCase {
     private func snapshot(
         current: LiveSubtitle,
         previous: LiveSubtitle? = nil,
+        statusBanner: String? = nil,
         previousOpacity: Double = 1
     ) -> SubtitleSnapshot {
         SubtitleSnapshot(
             current: current,
             previous: previous,
-            statusBanner: nil,
+            statusBanner: statusBanner,
             previousOpacity: previousOpacity
         )
     }
