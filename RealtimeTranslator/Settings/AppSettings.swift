@@ -2,15 +2,10 @@ import CoreGraphics
 import Foundation
 import Observation
 
-enum SubtitleDisplayMode: String, Sendable {
-    case both
-}
-
 enum TranslationState: String, Sendable {
     case idle
     case connecting
     case listening
-    case reconnecting
     case closing
     case error
 }
@@ -24,8 +19,6 @@ final class AppSettings {
         static let panelOriginY = "panelOriginY"
         static let hasCustomPanelOrigin = "hasCustomPanelOrigin"
     }
-
-    var displayMode: SubtitleDisplayMode = .both
 
     var fontSize: Double {
         didSet { UserDefaults.standard.set(fontSize, forKey: Keys.fontSize) }

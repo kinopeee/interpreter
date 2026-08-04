@@ -11,7 +11,6 @@ final class SubtitleWindowController: NSObject {
     private let translationHostingView: NSHostingView<LocalTranslationHostView>
     private let controlContainerView = NSView()
     private var snapshot = SubtitleSnapshot.empty
-    private var displayMode: SubtitleDisplayMode = .both
     private var fontSize: Double = 32
     private var translationState: TranslationState = .idle
     private var onToggleRecording: () -> Void = {}
@@ -24,7 +23,6 @@ final class SubtitleWindowController: NSObject {
     init(translationService: LocalTranslationService) {
         let subtitleView = SubtitleView(
             snapshot: .empty,
-            displayMode: .both,
             fontSize: 32,
             isEditingPosition: false
         )
@@ -93,23 +91,15 @@ final class SubtitleWindowController: NSObject {
         controlPanel.orderFrontRegardless()
     }
 
-    func hide() {
-        panel.orderOut(nil)
-        controlPanel.orderOut(nil)
-    }
-
     func update(
         snapshot: SubtitleSnapshot,
-        displayMode: SubtitleDisplayMode,
         fontSize: Double,
         translationState: TranslationState
     ) {
         let shouldRenderSubtitles = self.snapshot.presentation != snapshot.presentation
-            || self.displayMode != displayMode
             || self.fontSize != fontSize
         let shouldRenderControls = self.translationState != translationState
         self.snapshot = snapshot
-        self.displayMode = displayMode
         self.fontSize = fontSize
         self.translationState = translationState
         if shouldRenderSubtitles {
@@ -193,7 +183,6 @@ final class SubtitleWindowController: NSObject {
     private func renderSubtitles() {
         hostingController.rootView = SubtitleView(
             snapshot: snapshot,
-            displayMode: displayMode,
             fontSize: fontSize,
             isEditingPosition: isEditingPosition
         )

@@ -18,11 +18,9 @@ final class AppCoordinator: NSObject {
     )
     private let hotKeys = HotKeyManager()
     private var settingsWindow: NSWindow?
-    private var lastUserMessage: String?
 
     func start() {
         NSApp.setActivationPolicy(.accessory)
-        settings.displayMode = .both
         interpretationSession.delegate = self
         menuBarController = MenuBarController(coordinator: self)
         subtitleWindow.setRecordingHandler { [weak self] in
@@ -32,7 +30,6 @@ final class AppCoordinator: NSObject {
         lastSnapshot = idleSnapshot
         subtitleWindow.update(
             snapshot: idleSnapshot,
-            displayMode: .both,
             fontSize: settings.fontSize,
             translationState: translationState
         )
@@ -55,7 +52,7 @@ final class AppCoordinator: NSObject {
         switch translationState {
         case .idle, .error:
             beginTranslation()
-        case .connecting, .listening, .reconnecting:
+        case .connecting, .listening:
             Task { await interpretationSession.stop() }
         case .closing:
             break
@@ -124,7 +121,6 @@ final class AppCoordinator: NSObject {
     }
 
     private func presentMessage(_ message: String) {
-        lastUserMessage = message
         let alert = NSAlert()
         alert.messageText = "Realtime Translator"
         alert.informativeText = message
@@ -141,22 +137,14 @@ extension AppCoordinator: InterpretationSessionDelegate {
         translationState = state
         menuBarController.refresh()
         writeStatusFile(state.rawValue)
+        if state == .idle, lastSnapshot.current.isEmpty, lastSnapshot.previous == nil {
+            lastSnapshot = idleSnapshot
+        }
         subtitleWindow.update(
             snapshot: lastSnapshot,
-            displayMode: .both,
             fontSize: settings.fontSize,
             translationState: state
         )
-        if state == .idle, lastSnapshot.current.isEmpty, lastSnapshot.previous == nil {
-            let snapshot = idleSnapshot
-            lastSnapshot = snapshot
-            subtitleWindow.update(
-                snapshot: snapshot,
-                displayMode: .both,
-                fontSize: settings.fontSize,
-                translationState: translationState
-            )
-        }
     }
 
     func interpretationSession(
@@ -176,7 +164,6 @@ extension AppCoordinator: InterpretationSessionDelegate {
         lastSnapshot = displayedSnapshot
         subtitleWindow.update(
             snapshot: displayedSnapshot,
-            displayMode: .both,
             fontSize: settings.fontSize,
             translationState: translationState
         )
@@ -186,7 +173,6 @@ extension AppCoordinator: InterpretationSessionDelegate {
         _ session: InterpretationSession,
         didEncounterMessage message: String
     ) {
-        // Avoid modal spam during reconnect loops; surface via banner already.
         if translationState == .error {
             presentMessage(message)
         }

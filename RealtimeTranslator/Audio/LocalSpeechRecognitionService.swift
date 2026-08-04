@@ -1,5 +1,4 @@
 @preconcurrency import AVFoundation
-import CoreMedia
 import Foundation
 import os
 import Speech
@@ -177,9 +176,8 @@ final class LocalSpeechRecognitionService: LocalSpeechRecognitionServicing {
     private var lifecycleState: LifecycleState = .idle
     private var lifecycleGeneration = 0
     private var acceptedResultGeneration: Int?
-    private(set) var isRunning = false
 
-    func requestPermission() async -> Bool {
+    private func requestPermission() async -> Bool {
         await withCheckedContinuation { continuation in
             AVCaptureDevice.requestAccess(for: .audio) { granted in
                 continuation.resume(returning: granted)
@@ -224,7 +222,6 @@ final class LocalSpeechRecognitionService: LocalSpeechRecognitionServicing {
             cancelLanguageSelectionTask()
             lastEmittedSignature = nil
             acceptedResultGeneration = generation
-            isRunning = true
             lifecycleState = .running(generation)
             delegate?.localSpeechRecognitionService(
                 didUpdateStatus: "録音中… 話してください"
@@ -232,7 +229,6 @@ final class LocalSpeechRecognitionService: LocalSpeechRecognitionServicing {
         } catch {
             await cleanUpFailedStart(startupResources)
             if isStartupCurrent(generation) {
-                isRunning = false
                 lifecycleState = .idle
             }
             throw error
@@ -250,7 +246,6 @@ final class LocalSpeechRecognitionService: LocalSpeechRecognitionServicing {
         lifecycleGeneration += 1
         let generation = lifecycleGeneration
         lifecycleState = .stopping(generation)
-        isRunning = false
 
         let pipeline = runningPipeline
         runningPipeline = nil

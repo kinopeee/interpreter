@@ -1,16 +1,5 @@
 import Foundation
 
-enum InterpretationSessionError: Error, LocalizedError, Sendable {
-    case alreadyRunning
-
-    var errorDescription: String? {
-        switch self {
-        case .alreadyRunning:
-            return "録音はすでに開始されています"
-        }
-    }
-}
-
 @MainActor
 protocol InterpretationSessionDelegate: AnyObject {
     func interpretationSession(
@@ -27,7 +16,6 @@ protocol InterpretationSessionDelegate: AnyObject {
     )
 }
 
-/// Fully on-device speech recognition and translation session.
 @MainActor
 final class InterpretationSession {
     private struct PendingTranscription {

@@ -11,15 +11,10 @@ enum SubtitleVisualStyle {
     static func translatedTextOpacity(for subtitle: LiveSubtitle) -> Double {
         subtitle.translatedText.isEmpty ? 0 : 1
     }
-
-    static func previousBlockOpacity(for snapshot: SubtitleSnapshot) -> Double {
-        snapshot.previousOpacity
-    }
 }
 
 struct SubtitleView: View {
     let snapshot: SubtitleSnapshot
-    let displayMode: SubtitleDisplayMode
     let fontSize: Double
     let isEditingPosition: Bool
 
@@ -44,7 +39,7 @@ struct SubtitleView: View {
 
             if let previous = snapshot.previous, !previous.isEmpty {
                 subtitleBlock(previous, isPrevious: true)
-                    .opacity(SubtitleVisualStyle.previousBlockOpacity(for: snapshot))
+                    .opacity(snapshot.previousOpacity)
             }
 
             if !snapshot.current.isEmpty {
@@ -150,7 +145,7 @@ struct RecordingControlView: View {
 
     private var isRecording: Bool {
         switch state {
-        case .connecting, .listening, .reconnecting, .closing:
+        case .connecting, .listening, .closing:
             return true
         case .idle, .error:
             return false

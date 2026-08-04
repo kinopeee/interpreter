@@ -56,35 +56,35 @@ final class SubtitleAggregator: @unchecked Sendable {
             isTranslationCurrent: isTranslationCurrent,
             canFinalize: canFinalize
         )
-        return snapshotLocked(now: now)
+        return snapshotLocked()
     }
 
     @discardableResult
     func appendSource(_ delta: String, now: Date = Date()) -> SubtitleSnapshot {
         lock.lock()
         defer { lock.unlock() }
-        guard !delta.isEmpty else { return snapshotLocked(now: now) }
+        guard !delta.isEmpty else { return snapshotLocked() }
         current.sourceText += delta
         current.isTranslationCurrent = false
         current.canFinalize = false
         current.lastUpdatedAt = now
         current.state = .live
         finalizeIfNeededLocked(now: now)
-        return snapshotLocked(now: now)
+        return snapshotLocked()
     }
 
     @discardableResult
     func appendTranslation(_ delta: String, now: Date = Date()) -> SubtitleSnapshot {
         lock.lock()
         defer { lock.unlock() }
-        guard !delta.isEmpty else { return snapshotLocked(now: now) }
+        guard !delta.isEmpty else { return snapshotLocked() }
         current.translatedText += delta
         current.isTranslationCurrent = true
         current.canFinalize = true
         current.lastUpdatedAt = now
         current.state = .live
         finalizeIfNeededLocked(now: now)
-        return snapshotLocked(now: now)
+        return snapshotLocked()
     }
 
     @discardableResult
@@ -93,7 +93,7 @@ final class SubtitleAggregator: @unchecked Sendable {
         defer { lock.unlock() }
         finalizeIfNeededLocked(now: now)
         updatePreviousOpacityLocked(now: now)
-        return snapshotLocked(now: now)
+        return snapshotLocked()
     }
 
     @discardableResult
@@ -106,7 +106,7 @@ final class SubtitleAggregator: @unchecked Sendable {
             clearCurrentLocked(now: now)
         }
         updatePreviousOpacityLocked(now: now)
-        return snapshotLocked(now: now)
+        return snapshotLocked()
     }
 
     @discardableResult
@@ -127,7 +127,7 @@ final class SubtitleAggregator: @unchecked Sendable {
             canFinalize: true
         )
         guard hasCompletePair(finalized) else {
-            return snapshotLocked(now: now)
+            return snapshotLocked()
         }
 
         previous = finalized
@@ -137,14 +137,14 @@ final class SubtitleAggregator: @unchecked Sendable {
             clearCurrentLocked(now: now)
         }
         updatePreviousOpacityLocked(now: now)
-        return snapshotLocked(now: now)
+        return snapshotLocked()
     }
 
     func snapshot(now: Date = Date()) -> SubtitleSnapshot {
         lock.lock()
         defer { lock.unlock() }
         updatePreviousOpacityLocked(now: now)
-        return snapshotLocked(now: now)
+        return snapshotLocked()
     }
 
     private func finalizeIfNeededLocked(now: Date) {
@@ -223,9 +223,8 @@ final class SubtitleAggregator: @unchecked Sendable {
         }
     }
 
-    private func snapshotLocked(now: Date) -> SubtitleSnapshot {
-        _ = now
-        return SubtitleSnapshot(
+    private func snapshotLocked() -> SubtitleSnapshot {
+        SubtitleSnapshot(
             current: current,
             previous: previous,
             statusBanner: statusBanner,
@@ -240,14 +239,14 @@ final class SubtitleAggregator: @unchecked Sendable {
     }
 
     private func exceedsMaxLength(_ text: String, japanesePreferred: Bool) -> Bool {
-        let limit = japanesePreferred ? config.maxJapaneseCharacters : config.maxEnglishCharacters
-        // Prefer Japanese limit when text contains CJK; otherwise English limit.
         let hasCJK = text.unicodeScalars.contains { scalar in
             (0x3040...0x30FF).contains(scalar.value)
                 || (0x4E00...0x9FFF).contains(scalar.value)
                 || (0x3400...0x4DBF).contains(scalar.value)
         }
-        let effective = hasCJK ? config.maxJapaneseCharacters : (japanesePreferred ? limit : config.maxEnglishCharacters)
-        return text.count > effective
+        let limit = hasCJK || japanesePreferred
+            ? config.maxJapaneseCharacters
+            : config.maxEnglishCharacters
+        return text.count > limit
     }
 }

@@ -102,7 +102,7 @@ final class MenuBarController: NSObject {
 
     private func startStopTitle() -> String {
         switch coordinator?.translationState {
-        case .connecting, .listening, .reconnecting, .closing:
+        case .connecting, .listening, .closing:
             return "翻訳を停止"
         case .idle, .error, .none:
             return "翻訳を開始"
@@ -120,8 +120,6 @@ final class MenuBarController: NSObject {
             symbolName = "ellipsis.bubble"
         case .listening:
             symbolName = "waveform.badge.mic"
-        case .reconnecting:
-            symbolName = "arrow.triangle.2.circlepath"
         case .error:
             symbolName = "exclamationmark.bubble"
         }

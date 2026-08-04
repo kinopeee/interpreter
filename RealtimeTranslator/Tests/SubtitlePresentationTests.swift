@@ -114,21 +114,6 @@ final class SubtitlePresentationTests: XCTestCase {
         XCTAssertEqual(opacity, 0)
     }
 
-    func testPreviousBlockRemainsFullOpacityUntilFadeStarts() {
-        // Given: 保持時間内でopacityが1の確定済み前文
-        let snapshot = snapshot(
-            current: .empty,
-            previous: subtitle(source: "前文", translation: "Previous"),
-            previousOpacity: 1
-        )
-
-        // When: 前文ブロックの表示opacityを算出する
-        let opacity = SubtitleVisualStyle.previousBlockOpacity(for: snapshot)
-
-        // Then: currentからpreviousへの移動だけでは暗くしない
-        XCTAssertEqual(opacity, 1)
-    }
-
     func testTextLayoutUsesCompactLimitsAndKeepsSentenceEnd() {
         // Given: 行数を超える現在文と前文を同時に表示する字幕
         // When: 各ブロックの最大行数と省略位置の設定を確認する
@@ -149,7 +134,6 @@ final class SubtitlePresentationTests: XCTestCase {
             snapshot: snapshot(
                 current: subtitle(source: "", translation: "Short translation")
             ),
-            displayMode: .both,
             fontSize: 32,
             isEditingPosition: false
         )
@@ -161,7 +145,6 @@ final class SubtitlePresentationTests: XCTestCase {
             snapshot: snapshot(
                 current: subtitle(source: "", translation: longText)
             ),
-            displayMode: .both,
             fontSize: 32,
             isEditingPosition: false
         )
@@ -196,7 +179,6 @@ final class SubtitlePresentationTests: XCTestCase {
             snapshot: snapshot(
                 current: subtitle(source: longText, translation: longText)
             ),
-            displayMode: .both,
             fontSize: 32,
             translationState: .listening
         )
@@ -238,7 +220,6 @@ final class SubtitlePresentationTests: XCTestCase {
             snapshot: snapshot(
                 current: subtitle(source: "短い原文", translation: "Short translation")
             ),
-            displayMode: .both,
             fontSize: 32,
             translationState: .listening
         )
@@ -258,7 +239,6 @@ final class SubtitlePresentationTests: XCTestCase {
             snapshot: snapshot(
                 current: subtitle(source: longerText, translation: longerText)
             ),
-            displayMode: .both,
             fontSize: 32,
             translationState: .listening
         )
