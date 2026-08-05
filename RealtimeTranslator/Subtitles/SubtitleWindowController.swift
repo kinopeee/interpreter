@@ -8,7 +8,6 @@ final class SubtitleWindowController: NSObject {
     private let hostingController: NSHostingController<SubtitleView>
     private let subtitleContainerView: NSView
     private let controlHostingView: NSHostingView<RecordingControlView>
-    private let translationHostingView: NSHostingView<LocalTranslationHostView>
     private let controlContainerView = NSView()
     private var snapshot = SubtitleSnapshot.empty
     private var fontSize: Double = 32
@@ -20,7 +19,7 @@ final class SubtitleWindowController: NSObject {
     private var dragStartPanelOrigin: NSPoint?
     private var dragStartMouseLocation: NSPoint?
 
-    init(translationService: LocalTranslationService) {
+    override init() {
         let subtitleView = SubtitleView(
             snapshot: .empty,
             fontSize: 32,
@@ -43,9 +42,6 @@ final class SubtitleWindowController: NSObject {
         controlHostingView = NSHostingView(
             rootView: RecordingControlView(state: .idle, onToggleRecording: {})
         )
-        translationHostingView = NSHostingView(
-            rootView: LocalTranslationHostView(service: translationService)
-        )
         super.init()
         subtitleContainerView.autoresizesSubviews = true
         hostingController.view.frame = subtitleContainerView.bounds
@@ -58,13 +54,7 @@ final class SubtitleWindowController: NSObject {
         controlContainerView.autoresizingMask = [.width, .height]
         controlHostingView.frame = controlContainerView.bounds
         controlHostingView.autoresizingMask = [.width, .height]
-        translationHostingView.frame = NSRect(x: 0, y: 0, width: 1, height: 1)
-        // 0ではなく0.01: 完全に不可視にするとSwiftUIがビューを非アクティブ扱いし、
-        // `translationTask`が動かず翻訳セッションを受け取れなくなる。
-        // このビューは破棄・再生成してはならない(AGENTS.mdの不変条件)。
-        translationHostingView.alphaValue = 0.01
         controlContainerView.addSubview(controlHostingView)
-        controlContainerView.addSubview(translationHostingView)
         controlPanel.contentView = controlContainerView
         controlPanel.orderFrontRegardless()
 

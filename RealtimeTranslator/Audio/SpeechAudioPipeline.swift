@@ -172,7 +172,7 @@ final class AnalyzerAudioConverter: @unchecked Sendable {
         let ratio = outputFormat.sampleRate / input.format.sampleRate
         let capacity = AVAudioFrameCount(Double(input.frameLength) * ratio) + 32
         guard let output = AVAudioPCMBuffer(pcmFormat: outputFormat, frameCapacity: capacity) else {
-            throw LocalSpeechRecognitionError.audioConverterUnavailable
+            throw RealtimeAudioCaptureError.audioConverterUnavailable
         }
 
         let provider = AnalyzerInputProvider(buffer: input)
@@ -190,7 +190,7 @@ final class AnalyzerAudioConverter: @unchecked Sendable {
             throw conversionError
         }
         guard status != .error else {
-            throw LocalSpeechRecognitionError.audioConverterUnavailable
+            throw RealtimeAudioCaptureError.audioConverterUnavailable
         }
         return output
     }

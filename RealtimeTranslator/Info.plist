@@ -25,10 +25,8 @@
 	<key>LSUIElement</key>
 	<true/>
 	<key>NSMicrophoneUsageDescription</key>
-	<string>リアルタイム翻訳字幕を生成するためにマイクを使用します。</string>
+	<string>リアルタイム翻訳字幕を生成するため、マイク音声をOpenAI APIへ送信します。</string>
 	<key>NSPrincipalClass</key>
 	<string>NSApplication</string>
-	<key>NSSpeechRecognitionUsageDescription</key>
-	<string>音声を端末内で文字起こしし、翻訳字幕を生成するために使用します。</string>
 </dict>
 </plist>

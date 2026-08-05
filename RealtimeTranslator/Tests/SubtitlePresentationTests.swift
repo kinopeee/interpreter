@@ -218,9 +218,7 @@ final class SubtitlePresentationTests: XCTestCase {
                 .compactMap { $0 as? SubtitlePanel }
                 .map(ObjectIdentifier.init)
         )
-        let controller = SubtitleWindowController(
-            translationService: LocalTranslationService()
-        )
+        let controller = SubtitleWindowController()
         defer { controller.tearDown() }
         let longText = Array(
             repeating: "画面外へ押し出されない長文字幕を表示します。",
@@ -265,9 +263,7 @@ final class SubtitlePresentationTests: XCTestCase {
                 .compactMap { $0 as? SubtitlePanel }
                 .map(ObjectIdentifier.init)
         )
-        let controller = SubtitleWindowController(
-            translationService: LocalTranslationService()
-        )
+        let controller = SubtitleWindowController()
         defer { controller.tearDown() }
         controller.update(
             snapshot: snapshot(

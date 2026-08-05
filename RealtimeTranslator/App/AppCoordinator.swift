@@ -4,24 +4,35 @@ import SwiftUI
 @MainActor
 final class AppCoordinator: NSObject {
     let settings = AppSettings()
+    let apiKeyStore: any APIKeyStore
 
     private(set) var translationState: TranslationState = .idle
     private(set) var isEditingSubtitlePosition = false
 
     private var menuBarController: MenuBarController!
-    private let localTranslationService = LocalTranslationService()
-    private lazy var subtitleWindow = SubtitleWindowController(
-        translationService: localTranslationService
-    )
+    private lazy var subtitleWindow = SubtitleWindowController()
     private lazy var interpretationSession = InterpretationSession(
-        translationService: localTranslationService
+        apiKeyStore: apiKeyStore
     )
     private let hotKeys = HotKeyManager()
     private var settingsWindow: NSWindow?
     private var lastSnapshot = SubtitleSnapshot.empty
 
+    init(apiKeyStore: any APIKeyStore = KeychainAPIKeyStore()) {
+        self.apiKeyStore = apiKeyStore
+        super.init()
+    }
+
     func start() {
         NSApp.setActivationPolicy(.accessory)
+        do {
+            _ = try APIKeyBootstrap.importFromEnvironmentIfNeeded(store: apiKeyStore)
+        } catch {
+            AppLogger.general.error(
+                "API key bootstrap failed: \(error.localizedDescription, privacy: .public)"
+            )
+        }
+
         interpretationSession.delegate = self
         menuBarController = MenuBarController(coordinator: self)
         subtitleWindow.setRecordingHandler { [weak self] in
@@ -37,7 +48,7 @@ final class AppCoordinator: NSObject {
         subtitleWindow.show()
         registerHotKeys()
         menuBarController.refresh()
-        AppLogger.general.info("AppCoordinator started in local-only mode")
+        AppLogger.general.info("AppCoordinator started with OpenAI Realtime translation")
     }
 
     private var idleSnapshot: SubtitleSnapshot {
@@ -51,7 +62,7 @@ final class AppCoordinator: NSObject {
         switch translationState {
         case .idle, .error:
             beginTranslation()
-        case .connecting, .listening:
+        case .connecting, .listening, .reconnecting:
             Task { await interpretationSession.stop() }
         case .closing:
             break
@@ -59,6 +70,17 @@ final class AppCoordinator: NSObject {
     }
 
     private func beginTranslation() {
+        guard settings.hasAcceptedCurrentOpenAIConsent else {
+            presentMessage("録音を開始する前に、設定でOpenAIへの送信に同意してください。")
+            openSettings()
+            return
+        }
+        guard apiKeyStore.hasStoredKey else {
+            presentMessage("録音を開始する前に、設定でOpenAI APIキーを保存してください。")
+            openSettings()
+            return
+        }
+
         writeStatusFile("starting")
         Task { await interpretationSession.start() }
     }
@@ -83,14 +105,17 @@ final class AppCoordinator: NSObject {
             return
         }
 
-        let view = SettingsView(settings: settings) { [weak self] in
+        let view = SettingsView(
+            settings: settings,
+            apiKeyStore: apiKeyStore
+        ) { [weak self] in
             self?.menuBarController.refresh()
         }
         let hosting = NSHostingController(rootView: view)
         let window = NSWindow(contentViewController: hosting)
         window.title = "Realtime Translator 設定"
         window.styleMask = [.titled, .closable]
-        window.setContentSize(NSSize(width: 460, height: 440))
+        window.setContentSize(NSSize(width: 560, height: 520))
         window.center()
         window.isReleasedWhenClosed = false
         settingsWindow = window

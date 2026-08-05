@@ -103,7 +103,13 @@ final class SubtitleAggregator: @unchecked Sendable {
     func forceFinalize(now: Date = Date()) -> SubtitleSnapshot {
         lock.lock()
         defer { lock.unlock() }
-        if hasCompletePair(current) {
+        // 停止時は idle 用の canFinalize に依存せず、原文＋現行訳文が揃っていれば確定する。
+        let hasPair =
+            !current.sourceText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && !current.translatedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && current.isTranslationCurrent
+        if hasPair {
+            current.canFinalize = true
             current.state = .finalized
             current.lastUpdatedAt = now
         } else {
