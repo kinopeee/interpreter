@@ -111,4 +111,28 @@ final class SpokenLanguageDetectorTests: XCTestCase {
         // Then: 日本語切替を検出する
         XCTAssertEqual(recent, .japanese)
     }
+
+    func testRecentEvidenceIgnoresWhitespaceOnlyTail() {
+        // Given: 空白だけの原文
+        let text = "   \n\t  "
+
+        // When: 末尾ウィンドウで判定する
+        let recent = SpokenLanguageDetector.recentEvidence(in: text, window: 16)
+
+        // Then: 言語証拠なしとして扱う
+        XCTAssertEqual(recent, .none)
+    }
+
+    func testRecentEvidenceKeepsAmbiguousLatinAtJapaneseTail() {
+        // Given: 日本語がウィンドウ外へ流れ、末尾はLatin一語だけ
+        let text = "今日は会議です" + String(repeating: "-", count: 24) + " Cursor"
+
+        // When: 全文と末尾ウィンドウを比較する
+        let full = SpokenLanguageDetector.evidence(in: text)
+        let recent = SpokenLanguageDetector.recentEvidence(in: text, window: 16)
+
+        // Then: 全文は日本語、末尾一語だけでは英語切替にしない
+        XCTAssertEqual(full, .japanese)
+        XCTAssertEqual(recent, .ambiguousLatin)
+    }
 }

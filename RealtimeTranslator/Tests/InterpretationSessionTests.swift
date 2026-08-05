@@ -211,6 +211,109 @@ final class InterpretationSessionTests: XCTestCase {
         }
         await session.stop()
     }
+
+    func testAmbiguousLatinDoesNotFlipJapaneseRoute() async throws {
+        // Given: 日本語ルーティング済みのlisteningセッション
+        let apiKeyStore = InMemoryAPIKeyStore(initialKey: "sk-test")
+        let audio = FakeRealtimeAudioCaptureService()
+        let dual = FakeDualRealtimeTranslationClient()
+        let session = InterpretationSession(
+            apiKeyStore: apiKeyStore,
+            audioCapture: audio,
+            dualClient: dual,
+            activeTickerIntervalNanoseconds: 50_000_000
+        )
+        await session.start()
+        await waitUntil { session.state == .listening }
+        dual.emit(
+            target: .english,
+            event: .inputTranscriptDelta(delta: "今日は会議です", eventID: "s1", elapsedMs: 1)
+        )
+        await waitUntil { dual.spokenLanguages == [.japanese] }
+        let resetsAfterJapanese = dual.resetAudioRoutingCallCount
+
+        // When: 日本語が末尾ウィンドウ外へ流れ、Latin固有名詞一語だけが残る
+        dual.emit(
+            target: .english,
+            event: .inputTranscriptDelta(
+                delta: String(repeating: "-", count: 24) + " Cursor",
+                eventID: "s2",
+                elapsedMs: 2
+            )
+        )
+        try await Task.sleep(nanoseconds: 80_000_000)
+
+        // Then: ambiguousLatinだけでは英語へ切り替えない
+        XCTAssertEqual(dual.spokenLanguages, [.japanese])
+        XCTAssertEqual(dual.resetAudioRoutingCallCount, resetsAfterJapanese)
+        await session.stop()
+    }
+
+    func testInitialAmbiguousLatinRoutesAsEnglish() async throws {
+        // Given: 言語未判定のlisteningセッション
+        let apiKeyStore = InMemoryAPIKeyStore(initialKey: "sk-test")
+        let audio = FakeRealtimeAudioCaptureService()
+        let dual = FakeDualRealtimeTranslationClient()
+        let session = InterpretationSession(
+            apiKeyStore: apiKeyStore,
+            audioCapture: audio,
+            dualClient: dual,
+            activeTickerIntervalNanoseconds: 50_000_000
+        )
+        await session.start()
+        await waitUntil { session.state == .listening }
+
+        // When: 初回証拠がLatin一語だけ
+        dual.emit(
+            target: .english,
+            event: .inputTranscriptDelta(delta: "Cursor", eventID: "s1", elapsedMs: 1)
+        )
+
+        // Then: 初回は英語レーンへ仮ルーティングする
+        await waitUntil { dual.spokenLanguages == [.english] }
+        await session.stop()
+    }
+
+    func testTransportErrorResetsRoutingOnReconnect() async throws {
+        // Given: 日本語ルーティング済みのlisteningセッション
+        let apiKeyStore = InMemoryAPIKeyStore(initialKey: "sk-test")
+        let audio = FakeRealtimeAudioCaptureService()
+        let dual = FakeDualRealtimeTranslationClient()
+        let session = InterpretationSession(
+            apiKeyStore: apiKeyStore,
+            audioCapture: audio,
+            dualClient: dual,
+            activeTickerIntervalNanoseconds: 20_000_000
+        )
+        await session.start()
+        await waitUntil { session.state == .listening }
+        dual.emit(
+            target: .english,
+            event: .inputTranscriptDelta(delta: "今日は会議です", eventID: "s1", elapsedMs: 1)
+        )
+        await waitUntil { dual.spokenLanguages == [.japanese] }
+        let resetsBeforeError = dual.resetAudioRoutingCallCount
+        let startsBeforeError = dual.startCallCount
+
+        // When: transport errorで再接続する
+        dual.emit(
+            target: .english,
+            event: .error(message: "socket dropped", code: "transport")
+        )
+        await waitUntil(timeout: 3) {
+            session.state == .listening && dual.startCallCount > startsBeforeError
+        }
+
+        // Then: 再接続で言語判定と音声ルーティングをリセットする
+        XCTAssertGreaterThan(dual.resetAudioRoutingCallCount, resetsBeforeError)
+        XCTAssertEqual(dual.spokenLanguages, [.japanese])
+        dual.emit(
+            target: .english,
+            event: .inputTranscriptDelta(delta: "Hello how are you", eventID: "s2", elapsedMs: 1)
+        )
+        await waitUntil { dual.spokenLanguages == [.japanese, .english] }
+        await session.stop()
+    }
 }
 
 // MARK: - Fakes

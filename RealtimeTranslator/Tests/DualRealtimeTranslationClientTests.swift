@@ -311,6 +311,141 @@ final class DualRealtimeTranslationClientTests: XCTestCase {
         XCTAssertGreaterThanOrEqual(japaneseClose, 1)
     }
 
+    func testRollingPrerollKeepsOnlyLastTwoSeconds() async throws {
+        // Given: 未判定のまま2秒超のframeを送ったdual
+        let sourceTransport = FakeRealtimeWebSocketTransport()
+        let englishTransport = FakeRealtimeWebSocketTransport()
+        let japaneseTransport = FakeRealtimeWebSocketTransport()
+        let dual = makeDual(
+            sourceTransport: sourceTransport,
+            englishTransport: englishTransport,
+            japaneseTransport: japaneseTransport
+        )
+        try await startDual(
+            dual,
+            sourceTransport: sourceTransport,
+            englishTransport: englishTransport,
+            japaneseTransport: japaneseTransport
+        )
+        var frames: [Data] = []
+        for index in 0..<25 {
+            let frame = Data(repeating: UInt8(index & 0xFF), count: PCM16FramePacketizer.bytesPerFrame)
+            frames.append(frame)
+            try await dual.appendAudioFrame(frame)
+        }
+
+        // When: 日本語と判定してprerollをflushする
+        try await dual.setSpokenLanguage(.japanese)
+        try await waitUntilAppendCount(englishTransport, minimum: 20)
+
+        // Then: 直近20frame(2秒)だけが英訳targetへ届く
+        let englishAppends = try decodeAppendPayloads(await englishTransport.sent)
+        let expected = frames.suffix(20).map { $0.base64EncodedString() }
+        XCTAssertEqual(englishAppends, Array(expected))
+        XCTAssertTrue(try decodeAppendPayloads(await japaneseTransport.sent).isEmpty)
+        await dual.forceClose()
+    }
+
+    func testResetAudioRoutingKeepsPrerollForNextLanguage() async throws {
+        // Given: 日本語ルーティング後にresetしたdual
+        let sourceTransport = FakeRealtimeWebSocketTransport()
+        let englishTransport = FakeRealtimeWebSocketTransport()
+        let japaneseTransport = FakeRealtimeWebSocketTransport()
+        let dual = makeDual(
+            sourceTransport: sourceTransport,
+            englishTransport: englishTransport,
+            japaneseTransport: japaneseTransport
+        )
+        try await startDual(
+            dual,
+            sourceTransport: sourceTransport,
+            englishTransport: englishTransport,
+            japaneseTransport: japaneseTransport
+        )
+        let frameA = Data(repeating: 0x21, count: PCM16FramePacketizer.bytesPerFrame)
+        let frameB = Data(repeating: 0x22, count: PCM16FramePacketizer.bytesPerFrame)
+        let frameC = Data(repeating: 0x23, count: PCM16FramePacketizer.bytesPerFrame)
+        try await dual.appendAudioFrame(frameA)
+        try await dual.setSpokenLanguage(.japanese)
+        try await waitUntilAppendCount(englishTransport, minimum: 1)
+        let englishBeforeReset = try decodeAppendPayloads(await englishTransport.sent)
+        await dual.resetAudioRouting()
+
+        // When: reset後にframeを送り、再度日本語判定する
+        try await dual.appendAudioFrame(frameB)
+        let englishWhileReset = try decodeAppendPayloads(await englishTransport.sent)
+        try await dual.setSpokenLanguage(.japanese)
+        try await dual.appendAudioFrame(frameC)
+        try await waitUntilAppendCount(englishTransport, minimum: englishBeforeReset.count + 3)
+
+        // Then: reset中は翻訳へ送らず、再判定時にrolling prerollをflushする
+        XCTAssertEqual(englishWhileReset, englishBeforeReset)
+        let englishAppends = try decodeAppendPayloads(await englishTransport.sent)
+        XCTAssertEqual(
+            Array(englishAppends.suffix(3)),
+            [
+                frameA.base64EncodedString(),
+                frameB.base64EncodedString(),
+                frameC.base64EncodedString(),
+            ]
+        )
+        await dual.forceClose()
+    }
+
+    func testConsecutiveTranslationFailuresEmitTransportError() async throws {
+        // Given: 英訳targetの送信が失敗し続けるdual
+        let sourceTransport = FakeRealtimeWebSocketTransport()
+        let englishTransport = FakeRealtimeWebSocketTransport()
+        let japaneseTransport = FakeRealtimeWebSocketTransport()
+        let dual = makeDual(
+            sourceTransport: sourceTransport,
+            englishTransport: englishTransport,
+            japaneseTransport: japaneseTransport
+        )
+        try await startDual(
+            dual,
+            sourceTransport: sourceTransport,
+            englishTransport: englishTransport,
+            japaneseTransport: japaneseTransport
+        )
+        try await dual.setSpokenLanguage(.japanese)
+        await englishTransport.setSendError(
+            RealtimeTranslationError.recoverableTransportFailure("append failed")
+        )
+        let received = expectation(description: "連続失敗でtransport error")
+        let stream = await dual.events
+        let collector = Task {
+            for await event in stream {
+                if case .error(_, let code) = event.event, code == "transport" {
+                    received.fulfill()
+                    return event
+                }
+            }
+            return nil as RealtimeTranslationStreamEvent?
+        }
+
+        // When: 失敗上限まで音声frameを送る
+        for _ in 0..<3 {
+            try await dual.appendAudioFrame(
+                Data(repeating: 0x44, count: PCM16FramePacketizer.bytesPerFrame)
+            )
+        }
+        await fulfillment(of: [received], timeout: 1)
+
+        // Then: 原文送信は継続しつつ翻訳停滞をrecoverable errorとして通知する
+        let event = await collector.value
+        XCTAssertEqual(event?.target, .english)
+        if case .error(let message, let code) = event?.event {
+            XCTAssertEqual(code, "transport")
+            XCTAssertFalse(message.isEmpty)
+        } else {
+            XCTFail("Expected transport error event")
+        }
+        let sourceAppends = try decodeAppendPayloads(await sourceTransport.sent)
+        XCTAssertEqual(sourceAppends.count, 3)
+        await dual.forceClose()
+    }
+
     private func makeDual(
         sourceTransport: FakeRealtimeWebSocketTransport,
         englishTransport: FakeRealtimeWebSocketTransport,
