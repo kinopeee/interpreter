@@ -7,6 +7,8 @@ actor FakeRealtimeWebSocketTransport: RealtimeWebSocketTransport {
     private(set) var sent: [Data] = []
     private(set) var connectCount = 0
     private(set) var closeCount = 0
+    private(set) var lastConnectURL: URL?
+    private(set) var lastConnectHeaders: [String: String] = [:]
     var connectError: Error?
     var sendError: Error?
     /// セットするとsendがこの時間だけ待機してから通常処理へ進む。
@@ -28,11 +30,11 @@ actor FakeRealtimeWebSocketTransport: RealtimeWebSocketTransport {
 
     func connect(url: URL, headers: [String: String]) async throws {
         connectCount += 1
+        lastConnectURL = url
+        lastConnectHeaders = headers
         if let connectError {
             throw connectError
         }
-        _ = url
-        _ = headers
     }
 
     func send(_ data: Data) async throws {
