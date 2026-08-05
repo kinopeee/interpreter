@@ -58,18 +58,38 @@ struct BilingualSpeechArbiter: Sendable {
             endTime = candidate.endTime
         }
 
-        func substantiallyOverlaps(_ candidate: SpeechRecognitionCandidate) -> Bool {
-            substantiallyOverlaps(
+        /// 時間範囲が実質的に重なるか。確定済み区間の棄却と確定時のbucket掃除に使う。
+        /// 開始時刻の近さだけでは真にしない(短い確定の直後の別発話を落とさないため)。
+        func temporallyOverlaps(_ candidate: SpeechRecognitionCandidate) -> Bool {
+            temporallyOverlaps(
                 startTime: candidate.startTime,
                 endTime: candidate.endTime
             )
         }
 
-        func substantiallyOverlaps(_ other: SpeechRange) -> Bool {
-            substantiallyOverlaps(
+        func temporallyOverlaps(_ other: SpeechRange) -> Bool {
+            temporallyOverlaps(
                 startTime: other.startTime,
                 endTime: other.endTime
             )
+        }
+
+        /// 同一発話の日英2レーン候補として束ねてよいか。
+        /// 終了時刻のずれを吸収するため、開始が近ければ重なりが薄くても同一発話とみなす。
+        func matchesSameUtterance(_ candidate: SpeechRecognitionCandidate) -> Bool {
+            temporallyOverlaps(
+                startTime: candidate.startTime,
+                endTime: candidate.endTime
+            )
+                || abs(startTime - candidate.startTime) < Self.nearStartToleranceSeconds
+        }
+
+        func matchesSameUtterance(_ other: SpeechRange) -> Bool {
+            temporallyOverlaps(
+                startTime: other.startTime,
+                endTime: other.endTime
+            )
+                || abs(startTime - other.startTime) < Self.nearStartToleranceSeconds
         }
 
         func distance(to candidate: SpeechRecognitionCandidate) -> Double {
@@ -86,18 +106,17 @@ struct BilingualSpeechArbiter: Sendable {
             endTime = max(endTime, other.endTime)
         }
 
-        private func substantiallyOverlaps(
+        private func temporallyOverlaps(
             startTime otherStartTime: Double,
             endTime otherEndTime: Double
         ) -> Bool {
             let intersectionStart = max(startTime, otherStartTime)
             let intersectionEnd = min(endTime, otherEndTime)
             let intersection = max(0, intersectionEnd - intersectionStart)
-            let finalizedDuration = max(0.001, endTime - startTime)
-            let candidateDuration = max(0.001, otherEndTime - otherStartTime)
-            let shorterDuration = min(finalizedDuration, candidateDuration)
+            let ownDuration = max(0.001, endTime - startTime)
+            let otherDuration = max(0.001, otherEndTime - otherStartTime)
+            let shorterDuration = min(ownDuration, otherDuration)
             return intersection / shorterDuration >= Self.overlapRatioThreshold
-                || abs(startTime - otherStartTime) < Self.nearStartToleranceSeconds
         }
     }
 
@@ -108,7 +127,7 @@ struct BilingualSpeechArbiter: Sendable {
         var finalizedEmptyLanguages: Set<SpokenLanguage> = []
 
         func matches(_ candidate: SpeechRecognitionCandidate) -> Bool {
-            range.substantiallyOverlaps(candidate)
+            range.matchesSameUtterance(candidate)
         }
     }
 
@@ -140,7 +159,7 @@ struct BilingualSpeechArbiter: Sendable {
     mutating func submit(
         _ candidate: SpeechRecognitionCandidate
     ) -> SpeechRecognitionCandidate? {
-        guard !finalizedRanges.contains(where: { $0.substantiallyOverlaps(candidate) }) else {
+        guard !finalizedRanges.contains(where: { $0.temporallyOverlaps(candidate) }) else {
             return nil
         }
 
@@ -315,8 +334,10 @@ struct BilingualSpeechArbiter: Sendable {
     ) {
         let completedRange = SpeechRange(candidate)
         finalizedRanges.append(completedRange)
+        // 開始近接だけの別発話bucketは残す。時間的に重なる遅延候補だけを掃除し、
+        // 短い相槌の直後の本発話が確定済み扱いで消えるのを防ぐ。
         buckets.removeAll(where: {
-            $0.id == bucketID || $0.range.substantiallyOverlaps(completedRange)
+            $0.id == bucketID || $0.range.temporallyOverlaps(completedRange)
         })
         activeBucketID = nil
         activeLanguage = nil
@@ -326,7 +347,8 @@ struct BilingualSpeechArbiter: Sendable {
     private mutating func mergeOverlappingBuckets(containing bucketID: Int) -> Int {
         guard let seedBucket = bucket(withID: bucketID) else { return bucketID }
 
-        // フェーズ1: 重なりの推移閉包を計算し、統合対象のID集合と統合後の範囲を求める。
+        // フェーズ1: 同一発話とみなせるbucketの推移閉包を計算する。
+        // 日英レーンの終了時刻ずれ吸収のため、ここは開始近接も同一発話判定に含める。
         var mergedRange = seedBucket.range
         var mergedIDs: Set<Int> = [bucketID]
 
@@ -334,7 +356,7 @@ struct BilingualSpeechArbiter: Sendable {
         while didMerge {
             didMerge = false
             for bucket in buckets where !mergedIDs.contains(bucket.id) {
-                guard mergedRange.substantiallyOverlaps(bucket.range) else { continue }
+                guard mergedRange.matchesSameUtterance(bucket.range) else { continue }
                 mergedIDs.insert(bucket.id)
                 mergedRange.formUnion(bucket.range)
                 didMerge = true

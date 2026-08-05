@@ -115,6 +115,83 @@ final class BilingualSpeechArbiterTests: XCTestCase {
         XCTAssertNil(arbiter.activeLanguage)
     }
 
+    func testShortFinalDoesNotSuppressImmediateNextUtterance() {
+        // Given: 短い相槌が確定済みの判定器
+        var arbiter = BilingualSpeechArbiter()
+        _ = arbiter.submit(
+            candidate(
+                text: "はい",
+                language: .japanese,
+                confidence: 0.95,
+                isFinal: true,
+                start: 0,
+                end: 0.08
+            )
+        )
+        // 対向レーン待ち期限後の選択で短い相槌をfinalizedRangesへ入れる
+        let backchannel = arbiter.selectBestAvailable()
+        XCTAssertEqual(backchannel?.text, "はい")
+        XCTAssertTrue(backchannel?.isFinal == true)
+        XCTAssertNil(arbiter.activeLanguage)
+
+        // When: 相槌終了直後に始まる本発話が、開始近接(90ms)だけで届く
+        _ = arbiter.submit(
+            candidate(
+                text: "わかりました",
+                language: .japanese,
+                confidence: 0.9,
+                start: 0.09,
+                end: 1.2
+            )
+        )
+        let next = arbiter.submit(
+            candidate(
+                text: "I see",
+                language: .english,
+                confidence: 0.4,
+                start: 0.09,
+                end: 1.2
+            )
+        )
+
+        // Then: 開始近接だけで確定済み扱いせず、後続の本発話を表示する
+        XCTAssertEqual(next?.language, .japanese)
+        XCTAssertEqual(next?.text, "わかりました")
+        XCTAssertEqual(next?.startTime, 0.09)
+    }
+
+    func testLateOppositeLaneFinalStillDiscardedAfterShortUtterance() {
+        // Given: 短い日本語発話が確定済みの判定器
+        var arbiter = BilingualSpeechArbiter()
+        _ = arbiter.submit(
+            candidate(
+                text: "はい",
+                language: .japanese,
+                confidence: 0.95,
+                isFinal: true,
+                start: 0,
+                end: 0.08
+            )
+        )
+        _ = arbiter.selectBestAvailable()
+
+        // When: 同じ短い区間に重なる英語レーンの遅延finalが届く
+        let lateOpposite = arbiter.submit(
+            candidate(
+                text: "Yes",
+                language: .english,
+                confidence: 0.9,
+                isFinal: true,
+                start: 0.01,
+                end: 0.09
+            )
+        )
+
+        // Then: 時間的に重なる遅延候補は二重表示しない
+        XCTAssertNil(lateOpposite)
+        XCTAssertNil(arbiter.activeLanguage)
+    }
+
     func testQueuesNextRangeWhileCurrentRangeIsLocked() {
         // Given: 最初の区間で日本語レーンを選択済みの判定器
         var arbiter = BilingualSpeechArbiter()
