@@ -131,6 +131,52 @@ final class DualRealtimeTranslationClientTests: XCTestCase {
         XCTAssertTrue(japaneseAppends.isEmpty)
     }
 
+    func testLanguageSwitchFlushesRollingPrerollToNewTarget() async throws {
+        // Given: 日本語判定後にframeを送っているdual
+        let sourceTransport = FakeRealtimeWebSocketTransport()
+        let englishTransport = FakeRealtimeWebSocketTransport()
+        let japaneseTransport = FakeRealtimeWebSocketTransport()
+        let dual = makeDual(
+            sourceTransport: sourceTransport,
+            englishTransport: englishTransport,
+            japaneseTransport: japaneseTransport
+        )
+        try await startDual(
+            dual,
+            sourceTransport: sourceTransport,
+            englishTransport: englishTransport,
+            japaneseTransport: japaneseTransport
+        )
+        let frameA = Data(repeating: 0x11, count: PCM16FramePacketizer.bytesPerFrame)
+        let frameB = Data(repeating: 0x22, count: PCM16FramePacketizer.bytesPerFrame)
+        let frameC = Data(repeating: 0x33, count: PCM16FramePacketizer.bytesPerFrame)
+        try await dual.appendAudioFrame(frameA)
+        try await dual.setSpokenLanguage(.japanese)
+        try await dual.appendAudioFrame(frameB)
+        try await waitUntilAppendCount(englishTransport, minimum: 2)
+
+        // When: 英語へ切り替えて次frameを送る
+        try await dual.setSpokenLanguage(.english)
+        try await dual.appendAudioFrame(frameC)
+        try await waitUntilAppendCount(japaneseTransport, minimum: 3)
+
+        // Then: rolling prerollが和訳targetへflushされ、切替後は英語targetへ送らない
+        let englishAppends = try decodeAppendPayloads(await englishTransport.sent)
+        let japaneseAppends = try decodeAppendPayloads(await japaneseTransport.sent)
+        XCTAssertEqual(
+            englishAppends,
+            [frameA.base64EncodedString(), frameB.base64EncodedString()]
+        )
+        XCTAssertEqual(
+            japaneseAppends,
+            [
+                frameA.base64EncodedString(),
+                frameB.base64EncodedString(),
+                frameC.base64EncodedString(),
+            ]
+        )
+    }
+
     func testSourceAppendContinuesWhenTranslationSendHangs() async throws {
         // Given: 英語targetの送信が長時間停滞するdual
         let sourceTransport = FakeRealtimeWebSocketTransport()

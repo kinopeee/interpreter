@@ -161,6 +161,56 @@ final class InterpretationSessionTests: XCTestCase {
         XCTAssertFalse(finalSnapshot.current.translatedText.isEmpty)
         XCTAssertEqual(session.state, .idle)
     }
+
+    func testLanguageFlipFinalizesAndReroutes() async throws {
+        // Given: 日本語でルーティング済みのlisteningセッション
+        let apiKeyStore = InMemoryAPIKeyStore(initialKey: "sk-test")
+        let audio = FakeRealtimeAudioCaptureService()
+        let dual = FakeDualRealtimeTranslationClient()
+        let delegate = InterpretationSessionDelegateSpy()
+        let session = InterpretationSession(
+            apiKeyStore: apiKeyStore,
+            audioCapture: audio,
+            dualClient: dual,
+            activeTickerIntervalNanoseconds: 50_000_000
+        )
+        session.delegate = delegate
+        await session.start()
+        await waitUntil { session.state == .listening }
+
+        dual.emit(
+            target: .english,
+            event: .inputTranscriptDelta(delta: "今日は会議です", eventID: "s1", elapsedMs: 1)
+        )
+        dual.emit(
+            target: .english,
+            event: .outputTranscriptDelta(delta: "Today is a meeting", eventID: "t1", elapsedMs: 2)
+        )
+        await waitUntil { dual.spokenLanguages == [.japanese] }
+        await waitUntil {
+            delegate.latestSnapshot?.current.translatedText.contains("Today") == true
+        }
+        let resetsAfterJapanese = dual.resetAudioRoutingCallCount
+
+        // When: 間を空けず英語原文が続く
+        dual.emit(
+            target: .english,
+            event: .inputTranscriptDelta(
+                delta: " Hello how are you today",
+                eventID: "s2",
+                elapsedMs: 3
+            )
+        )
+
+        // Then: 言語切替で再ルーティングし、前セグメントが確定する
+        await waitUntil { dual.spokenLanguages == [.japanese, .english] }
+        XCTAssertGreaterThan(dual.resetAudioRoutingCallCount, resetsAfterJapanese)
+        await waitUntil {
+            delegate.latestSnapshot?.current.state == .finalized
+                || delegate.latestSnapshot?.current.sourceText.contains("Hello") == true
+        }
+        await session.stop()
+    }
 }
 
 // MARK: - Fakes
@@ -223,6 +273,8 @@ final class FakeDualRealtimeTranslationClient: DualRealtimeTranslationClienting,
     private(set) var startCallCount = 0
     private(set) var closeGracefullyCallCount = 0
     private(set) var forceCloseCallCount = 0
+    private(set) var spokenLanguages: [SpokenLanguage] = []
+    private(set) var resetAudioRoutingCallCount = 0
     var startGate: CheckedContinuationBox?
     var startFailuresRemaining = 0
     var startError: Error?
@@ -270,10 +322,12 @@ final class FakeDualRealtimeTranslationClient: DualRealtimeTranslationClienting,
     }
 
     func setSpokenLanguage(_ language: SpokenLanguage) async throws {
-        _ = language
+        spokenLanguages.append(language)
     }
 
-    func resetAudioRouting() async {}
+    func resetAudioRouting() async {
+        resetAudioRoutingCallCount += 1
+    }
 
     func closeGracefully() async throws {
         closeGracefullyCallCount += 1

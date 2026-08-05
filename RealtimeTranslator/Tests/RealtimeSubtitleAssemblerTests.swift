@@ -176,6 +176,63 @@ final class RealtimeSubtitleAssemblerTests: XCTestCase {
         XCTAssertEqual(finalized?.shouldFinalize, true)
     }
 
+    func testFinalizeForLanguageSwitchWithCompletePair() {
+        // Given: 完全ペアがあるassembler
+        var assembler = RealtimeSubtitleAssembler()
+        assembler.beginNewEpoch(1)
+        _ = assembler.ingest(event(.english, .inputTranscriptDelta(delta: "こんにちは", eventID: "s1", elapsedMs: 1)))
+        _ = assembler.ingest(event(.english, .outputTranscriptDelta(delta: "Hello", eventID: "t1", elapsedMs: 2)))
+
+        // When: 言語切替で確定する
+        let finalized = assembler.finalizeForLanguageSwitch()
+
+        // Then: 完全ペアが確定する
+        XCTAssertEqual(finalized?.shouldFinalize, true)
+        XCTAssertEqual(finalized?.sourceText, "こんにちは")
+        XCTAssertEqual(finalized?.translatedText, "Hello")
+    }
+
+    func testFinalizeForLanguageSwitchWithoutPairClearsBuffers() {
+        // Given: 原文だけのassembler
+        var assembler = RealtimeSubtitleAssembler()
+        assembler.beginNewEpoch(1)
+        _ = assembler.ingest(event(.english, .inputTranscriptDelta(delta: "こんにちは", eventID: "s1", elapsedMs: 1)))
+
+        // When: 言語切替する
+        let finalized = assembler.finalizeForLanguageSwitch()
+        let next = assembler.ingest(
+            event(.english, .inputTranscriptDelta(delta: "Hello there", eventID: "s2", elapsedMs: 2))
+        )
+
+        // Then: 原文だけの確定はせず、次の原文が新segmentになる
+        XCTAssertNil(finalized)
+        XCTAssertEqual(next?.sourceText, "Hello there")
+        XCTAssertEqual(next?.segmentGeneration, 1)
+    }
+
+    func testExpectedLaneIgnoresEchoFromOtherLane() {
+        // Given: 英語発話なので和訳laneを期待しているassembler
+        var assembler = RealtimeSubtitleAssembler()
+        assembler.beginNewEpoch(1)
+        assembler.expectLane(.japanese)
+        _ = assembler.ingest(
+            event(.english, .inputTranscriptDelta(delta: "Hello there", eventID: "s1", elapsedMs: 1))
+        )
+
+        // When: 旧英訳laneから同言語echoが先に届き、後から和訳が来る
+        let echo = assembler.ingest(
+            event(.english, .outputTranscriptDelta(delta: "Hello there", eventID: "e1", elapsedMs: 2))
+        )
+        let update = assembler.ingest(
+            event(.japanese, .outputTranscriptDelta(delta: "こんにちは", eventID: "j1", elapsedMs: 3))
+        )
+
+        // Then: echoではlaneを確定せず、期待laneの和訳を表示する
+        XCTAssertEqual(echo?.translatedText, "")
+        XCTAssertEqual(update?.translatedText, "こんにちは")
+        XCTAssertEqual(update?.isTranslationCurrent, true)
+    }
+
     private func event(
         _ target: RealtimeTranslationOutputLanguage,
         _ serverEvent: RealtimeTranslationServerEvent,

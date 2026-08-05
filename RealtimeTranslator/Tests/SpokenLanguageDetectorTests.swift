@@ -86,4 +86,29 @@ final class SpokenLanguageDetectorTests: XCTestCase {
         XCTAssertEqual(result, .unknown)
         XCTAssertNil(result.translationTarget)
     }
+
+    func testRecentEvidenceDetectsEnglishAfterJapanesePrefix() {
+        // Given: 先頭は日本語、末尾はウィンドウを埋める複数の英単語
+        let text = "今日は会議です Hello how are you doing today"
+
+        // When: 全文判定と末尾ウィンドウ判定を比較する
+        let full = SpokenLanguageDetector.evidence(in: text)
+        let recent = SpokenLanguageDetector.recentEvidence(in: text, window: 16)
+
+        // Then: 全文は日本語のまま、末尾は英語切替を検出する
+        // （空白を残すことでラテン語が1語に潰れず english になる）
+        XCTAssertEqual(full, .japanese)
+        XCTAssertEqual(recent, .english)
+    }
+
+    func testRecentEvidenceDetectsJapaneseAfterEnglishPrefix() {
+        // Given: 先頭は英語、末尾は日本語
+        let text = "Hello how are you 今日は会議です"
+
+        // When: 末尾ウィンドウで判定する
+        let recent = SpokenLanguageDetector.recentEvidence(in: text, window: 16)
+
+        // Then: 日本語切替を検出する
+        XCTAssertEqual(recent, .japanese)
+    }
 }

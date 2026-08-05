@@ -117,15 +117,10 @@ actor DualRealtimeTranslationClient: DualRealtimeTranslationClienting {
             )
         }
 
+        // 言語切替検出の遅延を吸収するため、選択後も直近2秒をrolling保持する。
+        appendRollingPreroll(pcm16LE)
         if let selectedTranslationTarget {
             enqueueTranslationFrame(pcm16LE, target: selectedTranslationTarget)
-        } else {
-            translationPrerollFrames.append(pcm16LE)
-            if translationPrerollFrames.count > Self.translationPrerollFrameLimit {
-                translationPrerollFrames.removeFirst(
-                    translationPrerollFrames.count - Self.translationPrerollFrameLimit
-                )
-            }
         }
     }
 
@@ -144,8 +139,9 @@ actor DualRealtimeTranslationClient: DualRealtimeTranslationClienting {
         }
         guard selectedTranslationTarget != target else { return }
         selectedTranslationTarget = target
+        // 旧target向けの未送信frameは破棄し、rolling prerollを新targetへflushする。
+        pendingTranslationFrames.removeAll(keepingCapacity: true)
         let preroll = translationPrerollFrames
-        translationPrerollFrames.removeAll(keepingCapacity: true)
         AppLogger.realtime.notice(
             "DBG_AUDIO_ROUTE target=\(target.rawValue, privacy: .public) frame=\(self.appendedFrameCount, privacy: .public) preroll=\(preroll.count, privacy: .public)"
         )
@@ -155,10 +151,19 @@ actor DualRealtimeTranslationClient: DualRealtimeTranslationClienting {
     }
 
     func resetAudioRouting() {
+        // rolling prerollは維持し、次のsetSpokenLanguageでflushできるようにする。
         selectedTranslationTarget = nil
-        translationPrerollFrames.removeAll(keepingCapacity: true)
         pendingTranslationFrames.removeAll(keepingCapacity: true)
         consecutiveTranslationFailures = 0
+    }
+
+    private func appendRollingPreroll(_ pcm16LE: Data) {
+        translationPrerollFrames.append(pcm16LE)
+        if translationPrerollFrames.count > Self.translationPrerollFrameLimit {
+            translationPrerollFrames.removeFirst(
+                translationPrerollFrames.count - Self.translationPrerollFrameLimit
+            )
+        }
     }
 
     func closeGracefully() async throws {

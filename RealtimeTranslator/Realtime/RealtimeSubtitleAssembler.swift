@@ -10,12 +10,6 @@ struct RealtimeSubtitleUpdate: Equatable, Sendable {
 
 /// 原文authorityと日英2出力を時間整列し、自動lane選択する。
 struct RealtimeSubtitleAssembler: Sendable {
-    private struct BufferedDelta: Equatable, Sendable {
-        let text: String
-        let elapsedMs: Int?
-        let eventID: String
-    }
-
     // Realtime Translation can pause output deltas for 5 seconds or more while
     // continuing the same sentence. A short idle cutoff truncates the translation.
     private static let idleFinalizeInterval: TimeInterval = 8
@@ -26,6 +20,7 @@ struct RealtimeSubtitleAssembler: Sendable {
     private var englishText = ""
     private var japaneseText = ""
     private var selectedLane: RealtimeTranslationOutputLanguage?
+    private var expectedLane: RealtimeTranslationOutputLanguage?
     private var seenEventIDs = Set<String>()
     private var lastActivityAt = Date.distantPast
     private var finalizedCutoffElapsedMs: Int?
@@ -35,6 +30,7 @@ struct RealtimeSubtitleAssembler: Sendable {
         self.epoch = epoch
         segmentGeneration = 0
         clearSegmentBuffers(advancingGeneration: false)
+        expectedLane = nil
         seenEventIDs.removeAll(keepingCapacity: true)
         finalizedCutoffElapsedMs = nil
         awaitingSourceAfterFinalize = false
@@ -42,6 +38,29 @@ struct RealtimeSubtitleAssembler: Sendable {
 
     mutating func beginNewEpoch(_ epoch: Int) {
         reset(epoch: epoch)
+    }
+
+    /// セッションが判定した期待翻訳lane。同言語echoより優先する。
+    mutating func expectLane(_ lane: RealtimeTranslationOutputLanguage?) {
+        expectedLane = lane
+        if selectedLane == nil {
+            resolveLaneIfNeeded()
+        }
+    }
+
+    /// 言語切替時に現行ペアを確定する。完全ペアがなければbufferだけクリアする。
+    mutating func finalizeForLanguageSwitch(now: Date = Date()) -> RealtimeSubtitleUpdate? {
+        let hasCompletePair =
+            !sourceText.isEmpty
+            && selectedLane != nil
+            && !currentTranslation.isEmpty
+        if hasCompletePair {
+            return finalizeCurrent(elapsedHint: nil, now: now)
+        }
+        clearSegmentBuffers(advancingGeneration: true)
+        awaitingSourceAfterFinalize = true
+        lastActivityAt = now
+        return nil
     }
 
     mutating func ingest(
@@ -125,9 +144,16 @@ struct RealtimeSubtitleAssembler: Sendable {
         lastActivityAt = now
 
         if selectedLane == nil {
-            // 一次信号: どちらのセッションが訳文を出したか。
-            if englishText.isEmpty != japaneseText.isEmpty {
-                selectedLane = englishText.isEmpty ? .japanese : .english
+            if let expectedLane, target == expectedLane {
+                // 期待laneの出力を優先。旧targetからの同言語echoで誤選択しない。
+                selectedLane = expectedLane
+            } else if expectedLane == nil {
+                // 一次信号: どちらのセッションが訳文を出したか。
+                if englishText.isEmpty != japaneseText.isEmpty {
+                    selectedLane = englishText.isEmpty ? .japanese : .english
+                } else {
+                    resolveLaneIfNeeded()
+                }
             } else {
                 resolveLaneIfNeeded()
             }
@@ -143,6 +169,20 @@ struct RealtimeSubtitleAssembler: Sendable {
 
     private mutating func resolveLaneIfNeeded() {
         guard selectedLane == nil else { return }
+
+        if let expectedLane {
+            switch expectedLane {
+            case .english where !englishText.isEmpty:
+                selectedLane = .english
+                return
+            case .japanese where !japaneseText.isEmpty:
+                selectedLane = .japanese
+                return
+            default:
+                // 期待laneがまだ出力していない間は、他laneのfirst-outputで確定しない。
+                return
+            }
+        }
 
         // 一次: 片側だけが出力していればそれを選ぶ。
         if !englishText.isEmpty && japaneseText.isEmpty {

@@ -328,23 +328,63 @@ final class InterpretationSession {
 
     private func updateAudioRouting(withSourceDelta delta: String) async throws {
         routingSourceText += delta
-        let detected: SpokenLanguage
-        switch SpokenLanguageDetector.evidence(in: routingSourceText) {
-        case .japanese:
-            detected = .japanese
-        case .english, .ambiguousLatin:
-            detected = .english
-        case .none:
-            detected = .unknown
+        let evidence = SpokenLanguageDetector.recentEvidence(in: routingSourceText)
+
+        if routedSpokenLanguage == .unknown {
+            let detected: SpokenLanguage
+            switch evidence {
+            case .japanese:
+                detected = .japanese
+            case .english, .ambiguousLatin:
+                detected = .english
+            case .none:
+                return
+            }
+            routedSpokenLanguage = detected
+            assembler.expectLane(Self.expectedTranslationLane(for: detected))
+            try await dualClient.setSpokenLanguage(detected)
+            return
         }
-        guard detected != .unknown, detected != routedSpokenLanguage else { return }
-        routedSpokenLanguage = detected
-        try await dualClient.setSpokenLanguage(detected)
+
+        // 確定的な文字種反転のみをセグメント境界とする（ambiguousLatinは除外）。
+        let flipped: SpokenLanguage?
+        switch evidence {
+        case .japanese where routedSpokenLanguage == .english:
+            flipped = .japanese
+        case .english where routedSpokenLanguage == .japanese:
+            flipped = .english
+        default:
+            flipped = nil
+        }
+        guard let flipped else { return }
+
+        if let finalized = assembler.finalizeForLanguageSwitch() {
+            enqueueRender(finalized)
+        }
+        await resetAudioRoutingForNextSegment()
+        routingSourceText = delta
+        routedSpokenLanguage = flipped
+        assembler.expectLane(Self.expectedTranslationLane(for: flipped))
+        try await dualClient.setSpokenLanguage(flipped)
+    }
+
+    private static func expectedTranslationLane(
+        for spoken: SpokenLanguage
+    ) -> RealtimeTranslationOutputLanguage? {
+        switch spoken {
+        case .japanese:
+            return .english
+        case .english:
+            return .japanese
+        case .unknown:
+            return nil
+        }
     }
 
     private func resetAudioRoutingForNextSegment() async {
         routingSourceText = ""
         routedSpokenLanguage = .unknown
+        assembler.expectLane(nil)
         await dualClient.resetAudioRouting()
     }
 

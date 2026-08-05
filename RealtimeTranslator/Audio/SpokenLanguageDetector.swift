@@ -13,6 +13,9 @@ enum SpokenLanguageEvidence: Equatable, Sendable {
 
 /// テキストの文字種(ひらがな・カタカナ・漢字・ラテン文字)から話者言語を推定する。
 enum SpokenLanguageDetector {
+    /// 言語切替検出用の末尾文字数（空白除く）。
+    static let recentEvidenceWindow = 16
+
     static func detect(_ text: String) -> SpokenLanguage {
         switch evidence(in: text) {
         case .japanese:
@@ -22,6 +25,32 @@ enum SpokenLanguageDetector {
         case .ambiguousLatin, .none:
             return .unknown
         }
+    }
+
+    /// 空白を除いた末尾N文字分の範囲だけで証拠を評価する。
+    /// 空白は語境界判定のため残す。日本語がウィンドウ外へ流れ出ると英語切替を検出できる。
+    static func recentEvidence(
+        in text: String,
+        window: Int = recentEvidenceWindow
+    ) -> SpokenLanguageEvidence {
+        guard window > 0, !text.isEmpty else {
+            return evidence(in: text)
+        }
+
+        var nonWhitespaceCount = 0
+        var start = text.endIndex
+        while start > text.startIndex, nonWhitespaceCount < window {
+            start = text.index(before: start)
+            let character = text[start]
+            if !character.isWhitespace && !character.isNewline {
+                nonWhitespaceCount += 1
+            }
+        }
+
+        guard nonWhitespaceCount > 0 else {
+            return .none
+        }
+        return evidence(in: String(text[start...]))
     }
 
     static func evidence(in text: String) -> SpokenLanguageEvidence {
