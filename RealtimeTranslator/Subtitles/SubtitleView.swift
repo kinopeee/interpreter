@@ -92,8 +92,10 @@ struct SubtitleView: View {
 
     @ViewBuilder
     private func subtitleBlock(_ subtitle: LiveSubtitle) -> some View {
-        let sourceText = subtitle.sourceText.isEmpty ? " " : subtitle.sourceText
-        let translatedText = subtitle.translatedText.isEmpty ? " " : subtitle.translatedText
+        let clippedSource = SubtitleTailClipper.clip(subtitle.sourceText)
+        let clippedTranslation = SubtitleTailClipper.clip(subtitle.translatedText)
+        let sourceText = clippedSource.isEmpty ? " " : clippedSource
+        let translatedText = clippedTranslation.isEmpty ? " " : clippedTranslation
 
         VStack(alignment: .leading, spacing: 4) {
             Text(sourceText)
@@ -159,7 +161,7 @@ struct RecordingControlView: View {
 
     private var isRecording: Bool {
         switch state {
-        case .connecting, .listening, .closing:
+        case .connecting, .listening, .reconnecting, .closing:
             return true
         case .idle, .error:
             return false

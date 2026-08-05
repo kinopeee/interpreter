@@ -1,26 +1,30 @@
 # Realtime Translator
 
-macOSメニューバー常駐の、ローカル完結型リアルタイム日英字幕翻訳アプリです。
+macOSメニューバー常駐の、OpenAI Realtime Translationによるリアルタイム日英字幕アプリです。
 
-`SpeechAnalyzer`で音声を文字起こしし、Apple Translationで日本語↔英語を翻訳します。音声・原文・翻訳は外部サービスへ送信しません。
+マイク音声をOpenAIの `gpt-live-transcribe` と `gpt-realtime-translate` へストリーミングし、原文と翻訳字幕をペア表示します。初回MVPでは翻訳音声の再生は行いません。
 
 ## 要件
 
 - macOS 26以降
 - Apple Silicon
 - Xcode 26 / XcodeGen
-- 初回モデル取得時のみインターネット接続
-
-APIキーや有料API契約は不要です。
+- インターネット接続（録音中は必須）
+- OpenAI APIキー（BYOK）と利用可能な課金設定
 
 ## セットアップ
 
 ```bash
 brew install xcodegen   # 未導入の場合
-cd /Users/yoo/dev/interpreter
+cd /Users/yoo/dev/interpreter-openai
 xcodegen generate
 open RealtimeTranslator.xcodeproj
 ```
+
+APIキーは次のいずれかで登録します。
+
+1. Xcode schemeの環境変数に `OPENAI_API_KEY` を設定して一度起動する（Keychainへ自動取り込み）
+2. アプリの設定画面から `SecureField` で入力して保存する
 
 CLIからビルド・起動する場合:
 
@@ -28,10 +32,12 @@ CLIからビルド・起動する場合:
 ./scripts/run.sh
 ```
 
+注意: `run.sh` は `open` 経由で起動するため、シェルの環境変数はアプリへ届かないことがあります。その場合はXcodeから取り込むか、設定画面で入力してください。`open --args` でキーを渡すのは禁止です。
+
 ## 使い方
 
 1. アプリを起動します。Dockには表示されず、メニューバーと字幕オーバーレイに表示されます。
-2. 初回はmacOSの案内に従い、マイク使用と日英モデルのダウンロードを許可します。
+2. 初回はマイク使用を許可し、設定でOpenAI送信への同意とAPIキー保存を完了します。
 3. 字幕上の「録音開始」を押して話します。
 4. 日本語音声は英語へ、英語音声は日本語へ自動翻訳されます。
 5. 「録音終了」で停止します。
@@ -43,11 +49,19 @@ CLIからビルド・起動する場合:
 ```text
 マイク
   → AVAudioEngine
-  → SpeechAnalyzer（日本語・英語、端末内）
-  → 信頼度による発話言語選択
-  → Apple Translation（反対言語、端末内）
+  → 24 kHz PCM16 mono / 100 ms frames
+  → gpt-live-transcribe（常時送信、原文delta、delay=low、far-field noise reduction）
+  → Realtime Translation WebSocket × 2
+      - 言語判定前は原文のみ＋直近2秒preroll
+      - target=en（日本語判定後にprerollから送信、英訳）
+      - target=ja（英語判定後にprerollから送信、和訳）
+  → lane選択と字幕整列
   → 原文＋翻訳のNSPanel字幕
 ```
+
+## 料金
+
+録音中はOpenAI APIの従量課金が発生します。原文文字起こし1系統と、判定された言語に対応する翻訳1系統へ音声を送信します。固定価格は保証しません。最新料金は [OpenAI Pricing](https://developers.openai.com/api/docs/pricing) を確認してください。
 
 ## テスト
 
@@ -62,7 +76,7 @@ xcodebuild test \
 
 ## 注意
 
-- 初回のみ、日英の音声認識・翻訳モデルをダウンロードします。
-- モデル取得後はオフラインで利用できます。
-- 翻訳API料金は発生しません。
+- マイク音声、原文、訳文はOpenAI APIへ送信されます。
+- オフラインでは翻訳できません。
+- APIキーはKeychainへ保存し、ログへ出力しません。
 - MVPでは翻訳音声の読み上げは行いません。

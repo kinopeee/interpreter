@@ -43,7 +43,7 @@ final class MenuBarController: NSObject {
         menu.addItem(.separator())
 
         let directionItem = NSMenuItem(
-            title: "翻訳方向: 自動（日本語 ↔ 英語）",
+            title: "翻訳方向: 自動（OpenAI Realtime、日本語 ↔ 英語）",
             action: nil,
             keyEquivalent: ""
         )
@@ -58,16 +58,13 @@ final class MenuBarController: NSObject {
         displayItem.isEnabled = false
         menu.addItem(displayItem)
 
-        let audioRoot = NSMenuItem(title: "翻訳音声", action: nil, keyEquivalent: "")
-        let audioMenu = NSMenu(title: "翻訳音声")
-        let muteItem = NSMenuItem(title: "ミュート", action: nil, keyEquivalent: "")
-        muteItem.state = .on
-        let playItem = NSMenuItem(title: "再生（MVP未対応）", action: nil, keyEquivalent: "")
-        playItem.isEnabled = false
-        audioMenu.addItem(muteItem)
-        audioMenu.addItem(playItem)
-        menu.setSubmenu(audioMenu, for: audioRoot)
-        menu.addItem(audioRoot)
+        let audioItem = NSMenuItem(
+            title: "翻訳音声: 字幕のみ",
+            action: nil,
+            keyEquivalent: ""
+        )
+        audioItem.isEnabled = false
+        menu.addItem(audioItem)
 
         menu.addItem(.separator())
         let editPositionItem = NSMenuItem(
@@ -102,7 +99,7 @@ final class MenuBarController: NSObject {
 
     private func startStopTitle() -> String {
         switch coordinator?.translationState {
-        case .connecting, .listening, .closing:
+        case .connecting, .listening, .reconnecting, .closing:
             return "翻訳を停止"
         case .idle, .error, .none:
             return "翻訳を開始"
@@ -116,7 +113,7 @@ final class MenuBarController: NSObject {
         switch state {
         case .idle:
             symbolName = "captions.bubble"
-        case .connecting, .closing:
+        case .connecting, .closing, .reconnecting:
             symbolName = "ellipsis.bubble"
         case .listening:
             symbolName = "waveform.badge.mic"
