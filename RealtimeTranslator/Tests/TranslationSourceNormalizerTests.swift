@@ -64,6 +64,42 @@ final class TranslationSourceNormalizerTests: XCTestCase {
         XCTAssertEqual(normalized, "今日は晴れです。")
     }
 
+    func testRemovesBoundedAmbiguousJapaneseFillers() {
+        // Given: 読点付きの曖昧フィラー(あの/その/まあ)
+        let samples = [
+            ("あの、今日は晴れです", "今日は晴れです。"),
+            ("その、大丈夫です", "大丈夫です。"),
+            ("まあ、大丈夫です", "大丈夫です。"),
+        ]
+
+        // When/Then: 区切りがあるときだけフィラー除去する
+        for (source, expected) in samples {
+            let normalized = TranslationSourceNormalizer.normalizeForFinalTranslation(
+                source,
+                language: .japanese
+            )
+            XCTAssertEqual(normalized, expected)
+        }
+    }
+
+    func testDoesNotStripJapaneseContentWordsThatShareFillerPrefixes() {
+        // Given: 指示語・畳語として文頭に来る「あの/その/まあ」
+        let samples = [
+            ("あの人が来ました", "あの人が来ました。"),
+            ("その通りです", "その通りです。"),
+            ("まあまあです", "まあまあです。"),
+        ]
+
+        // When/Then: 本文の接頭辞を削らず句読点だけ補う
+        for (source, expected) in samples {
+            let normalized = TranslationSourceNormalizer.normalizeForFinalTranslation(
+                source,
+                language: .japanese
+            )
+            XCTAssertEqual(normalized, expected)
+        }
+    }
+
     func testRemovesLeadingEnglishFiller() {
         // Given: 文頭にフィラーとカンマがある英文
         let source = "Um, I think so"

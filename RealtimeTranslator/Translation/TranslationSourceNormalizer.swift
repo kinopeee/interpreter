@@ -18,6 +18,18 @@ enum TranslationSourceNormalizer {
         "まあ",
     ]
 
+    /// 指示語・感動詞としても文頭に来るため、区切りなしのhasPrefix除去は本文を壊す。
+    /// 英語フィラーと同様、空白/読点/文末のときだけ除去する。
+    private static let japaneseFillersRequiringBoundary: Set<String> = [
+        "あの",
+        "その",
+        "まあ",
+    ]
+
+    private static let japaneseFillerBoundaryCharacters = CharacterSet
+        .whitespacesAndNewlines
+        .union(CharacterSet(charactersIn: "、,，"))
+
     private static let englishFillers = [
         "um",
         "uh",
@@ -59,6 +71,13 @@ enum TranslationSourceNormalizer {
         for filler in japaneseFillers.sorted(by: { $0.count > $1.count }) {
             guard text.hasPrefix(filler) else { continue }
             var remainder = String(text.dropFirst(filler.count))
+            if japaneseFillersRequiringBoundary.contains(filler),
+               let first = remainder.unicodeScalars.first,
+               !japaneseFillerBoundaryCharacters.contains(first)
+            {
+                // 「あの人」「その通り」「まあまあ」など、本文の接頭辞を誤除去しない。
+                continue
+            }
             if let first = remainder.first, "、,，".contains(first) {
                 remainder.removeFirst()
             }
