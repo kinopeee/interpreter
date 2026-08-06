@@ -225,4 +225,39 @@ final class SubtitleAggregatorTests: XCTestCase {
         // Then: 誤った原文・訳文ペアを確定せず、ライブ字幕も破棄する
         XCTAssertTrue(snapshot.current.isEmpty)
     }
+
+    func testFinalizePairRejectsEmptyOrWhitespaceTranslation() {
+        // Given: ライブペアを表示中の字幕集約器
+        let aggregator = SubtitleAggregator()
+        let now = Date()
+        _ = aggregator.replaceCurrent(
+            sourceText: "ライブ原文",
+            translatedText: "Live translation",
+            isTranslationCurrent: true,
+            canFinalize: false,
+            now: now
+        )
+
+        // When: 訳文が空または空白だけの確定要求が届く
+        let emptyTranslation = aggregator.finalizePair(
+            sourceText: "原文だけ",
+            translatedText: "",
+            clearCurrent: true,
+            now: now.addingTimeInterval(0.1)
+        )
+        let whitespaceTranslation = aggregator.finalizePair(
+            sourceText: "原文だけ",
+            translatedText: "   ",
+            clearCurrent: true,
+            now: now.addingTimeInterval(0.2)
+        )
+
+        // Then: 原文だけの確定を拒否し、既存のcurrentを維持する
+        XCTAssertEqual(emptyTranslation.current.sourceText, "ライブ原文")
+        XCTAssertEqual(emptyTranslation.current.translatedText, "Live translation")
+        XCTAssertEqual(emptyTranslation.current.state, .live)
+        XCTAssertEqual(whitespaceTranslation.current.sourceText, "ライブ原文")
+        XCTAssertEqual(whitespaceTranslation.current.translatedText, "Live translation")
+        XCTAssertEqual(whitespaceTranslation.current.state, .live)
+    }
 }
