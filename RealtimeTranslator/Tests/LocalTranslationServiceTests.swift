@@ -252,6 +252,41 @@ final class LocalTranslationServiceTests: XCTestCase {
             XCTAssertFalse(error.localizedDescription.isEmpty)
         }
     }
+
+    func testUnknownLanguageTranslationThrowsSessionUnavailable() async {
+        // Given: 準備済みの翻訳サービス
+        let service = LocalTranslationService()
+
+        // When: 言語不明のテキストを翻訳しようとする
+        do {
+            _ = try await service.translate(
+                "Acme",
+                from: .unknown,
+                priority: .final
+            )
+            XCTFail("言語不明の翻訳は失敗する必要があります")
+        } catch let error as LocalTranslationError {
+            // Then: レーン未定義としてsessionUnavailableを返す
+            XCTAssertEqual(error, .sessionUnavailable)
+        } catch {
+            XCTFail("想定外のエラー: \(error)")
+        }
+    }
+
+    func testEmptyTextReturnsEmptyWithoutQueueing() async throws {
+        // Given: ワーカー未起動の翻訳サービス
+        let service = LocalTranslationService()
+
+        // When: 空白だけの入力を翻訳する
+        let translated = try await service.translate(
+            "   ",
+            from: .japanese,
+            priority: .live
+        )
+
+        // Then: 空文字を即座に返し、レーン投入を避ける
+        XCTAssertEqual(translated, "")
+    }
 }
 
 private enum ControlledTranslationError: Error, LocalizedError, Equatable {

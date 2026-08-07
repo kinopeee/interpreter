@@ -410,6 +410,61 @@ final class InterpretationSessionTests: XCTestCase {
         await session.stop()
     }
 
+    func testOppositeLanguageEmptyDoesNotRetractCurrentUtterance() async throws {
+        // Given: 日本語原文のlive訳文を表示中のセッション
+        let speechService = FakeSpeechRecognitionService()
+        let translationService = FakeTranslationService()
+        translationService.translations["表示中の文"] = "Visible sentence"
+        let delegate = InterpretationSessionDelegateSpy()
+        let session = InterpretationSession(
+            translationService: translationService,
+            speechService: speechService
+        )
+        session.delegate = delegate
+        await session.start()
+        speechService.emit(text: "表示中の文", language: .japanese, isFinal: false)
+        await delegate.waitUntilCurrentTranslation("Visible sentence")
+        let snapshotCountBeforeOppositeEmpty = delegate.snapshots.count
+
+        // When: 対向の英語レーンから空のvolatile結果が届く
+        speechService.emit(text: "", language: .english, isFinal: false)
+
+        // Then: 日本語のcurrentと訳文を維持し、空文字を翻訳要求へ送らない
+        XCTAssertEqual(delegate.snapshots.count, snapshotCountBeforeOppositeEmpty)
+        let current = try XCTUnwrap(delegate.lastSnapshot?.current)
+        XCTAssertEqual(current.sourceText, "表示中の文")
+        XCTAssertEqual(current.translatedText, "Visible sentence")
+        XCTAssertTrue(current.isTranslationCurrent)
+        XCTAssertEqual(translationService.liveRequests, ["表示中の文"])
+        XCTAssertTrue(translationService.finalRequests.isEmpty)
+        await session.stop()
+    }
+
+    func testUnknownLanguageTranscriptionIsIgnored() async {
+        // Given: listening中の空字幕セッション
+        let speechService = FakeSpeechRecognitionService()
+        let translationService = FakeTranslationService()
+        let delegate = InterpretationSessionDelegateSpy()
+        let session = InterpretationSession(
+            translationService: translationService,
+            speechService: speechService
+        )
+        session.delegate = delegate
+        await session.start()
+        let snapshotCountBeforeUnknown = delegate.snapshots.count
+
+        // When: 言語不明の認識結果が届く
+        speechService.emit(text: "Acme", language: .unknown, isFinal: false)
+        speechService.emit(text: "12345", language: .unknown, isFinal: true)
+
+        // Then: 表示も翻訳要求も更新しない
+        XCTAssertEqual(delegate.snapshots.count, snapshotCountBeforeUnknown)
+        XCTAssertTrue(delegate.lastSnapshot?.current.isEmpty ?? true)
+        XCTAssertTrue(translationService.liveRequests.isEmpty)
+        XCTAssertTrue(translationService.finalRequests.isEmpty)
+        await session.stop()
+    }
+
     func testEmptyFinalDoesNotBlockFollowingFinalSentence() async {
         // Given: 日本語の暫定字幕を表示しているセッション
         let speechService = FakeSpeechRecognitionService()
