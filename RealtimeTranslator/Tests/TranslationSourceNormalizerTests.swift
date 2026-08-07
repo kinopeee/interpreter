@@ -78,6 +78,48 @@ final class TranslationSourceNormalizerTests: XCTestCase {
         XCTAssertEqual(normalized, "I think so.")
     }
 
+    func testRemovesLeadingMultiWordEnglishFiller() {
+        // Given: 複数語フィラー「you know」が文頭にある英文
+        let source = "You know, that works"
+
+        // When: final訳向けに正規化する
+        let normalized = TranslationSourceNormalizer.normalizeForFinalTranslation(
+            source,
+            language: .english
+        )
+
+        // Then: 最長一致で複数語フィラーをまとめて除去する
+        XCTAssertEqual(normalized, "that works.")
+    }
+
+    func testPrefersLongestJapaneseFillerPrefix() {
+        // Given: 短い「あの」にも最長「あのー」にも一致し得る文頭
+        let source = "あのー、会議を始めます"
+
+        // When: final訳向けに正規化する
+        let normalized = TranslationSourceNormalizer.normalizeForFinalTranslation(
+            source,
+            language: .japanese
+        )
+
+        // Then: 短い方を先に切らず「あのー」ごと除去する
+        XCTAssertEqual(normalized, "会議を始めます。")
+    }
+
+    func testUnknownLanguageLeavesTextUnchanged() {
+        // Given: 言語不明の認識テキスト
+        let source = "Acme"
+
+        // When: final訳向けに正規化する
+        let normalized = TranslationSourceNormalizer.normalizeForFinalTranslation(
+            source,
+            language: .unknown
+        )
+
+        // Then: フィラー除去も句読点補完も行わない
+        XCTAssertEqual(normalized, "Acme")
+    }
+
     func testFallsBackWhenFillerRemovalEmptiesText() {
         // Given: フィラーだけの日本語入力
         let source = "えーと"
