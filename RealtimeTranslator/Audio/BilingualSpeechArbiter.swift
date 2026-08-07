@@ -76,11 +76,6 @@ struct BilingualSpeechArbiter: Sendable {
             abs(startTime - candidate.startTime) + abs(endTime - candidate.endTime)
         }
 
-        mutating func formUnion(_ candidate: SpeechRecognitionCandidate) {
-            startTime = min(startTime, candidate.startTime)
-            endTime = max(endTime, candidate.endTime)
-        }
-
         mutating func formUnion(_ other: SpeechRange) {
             startTime = min(startTime, other.startTime)
             endTime = max(endTime, other.endTime)
@@ -256,8 +251,28 @@ struct BilingualSpeechArbiter: Sendable {
             buckets[bucketIndex].candidates[candidate.language] = candidate
             buckets[bucketIndex].finalizedEmptyLanguages.remove(candidate.language)
         }
-        buckets[bucketIndex].range.formUnion(candidate)
+        // バケット範囲は最良仮説(固定中は固定レーン)に合わせる。
+        // 敗者レーンの長い幻覚rangeでformUnionすると、隣接する別発話バケットまで
+        // マージされ、先に届いた発話がcandidates辞書上書きで消える。
+        refreshBucketRange(at: bucketIndex)
         return mergeOverlappingBuckets(containing: buckets[bucketIndex].id)
+    }
+
+    /// マッチングとマージに使う区間を、表示上の権威ある候補へ同期する。
+    private mutating func refreshBucketRange(at index: Int) {
+        let bucket = buckets[index]
+        let authoritative: SpeechRecognitionCandidate?
+        if let activeBucketID,
+           bucket.id == activeBucketID,
+           let activeLanguage,
+           let candidate = bucket.candidates[activeLanguage]
+        {
+            authoritative = candidate
+        } else {
+            authoritative = bucket.candidates.values.max(by: { $0.score < $1.score })
+        }
+        guard let authoritative else { return }
+        buckets[index].range = SpeechRange(authoritative)
     }
 
     private func bucket(withID id: Int) -> RangeBucket? {
@@ -376,7 +391,9 @@ struct BilingualSpeechArbiter: Sendable {
             candidates: candidates,
             finalizedEmptyLanguages: finalizedEmptyLanguages
         )
-        buckets.insert(mergedBucket, at: min(insertionIndex, buckets.endIndex))
+        let destinationIndex = min(insertionIndex, buckets.endIndex)
+        buckets.insert(mergedBucket, at: destinationIndex)
+        refreshBucketRange(at: destinationIndex)
         return survivorID
     }
 
