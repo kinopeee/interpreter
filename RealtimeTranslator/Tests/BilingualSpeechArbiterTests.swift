@@ -483,6 +483,158 @@ final class BilingualSpeechArbiterTests: XCTestCase {
         XCTAssertEqual(next?.startTime, 2)
     }
 
+    func testLongLosingLaneHypothesisDoesNotMergeSeparateUtterances() throws {
+        // Given: 離れた2つの日本語発話が、対向レーン待ちで別バケットに溜まっている
+        var arbiter = BilingualSpeechArbiter()
+        _ = arbiter.submit(
+            candidate(
+                text: "はい",
+                language: .japanese,
+                confidence: 0.9,
+                start: 0,
+                end: 0.5
+            )
+        )
+        _ = arbiter.submit(
+            candidate(
+                text: "会議を始めます",
+                language: .japanese,
+                confidence: 0.9,
+                start: 1.5,
+                end: 3
+            )
+        )
+
+        // When: 両者を覆う長い英語幻覚が届く
+        let selected = arbiter.submit(
+            candidate(
+                text: "incorrect long range",
+                language: .english,
+                confidence: 0.3,
+                start: 0,
+                end: 10
+            )
+        )
+
+        // Then: 長い敗者rangeで2発話を1バケットへ潰さない
+        // (formUnionすると後続テキストだけが残り「はい」が消える)
+        XCTAssertEqual(arbiter.pendingRangeCount, 2)
+        XCTAssertEqual(arbiter.activeLanguage, .japanese)
+        XCTAssertEqual(selected?.language, .japanese)
+        XCTAssertTrue(
+            selected?.text == "はい" || selected?.text == "会議を始めます"
+        )
+
+        let selectedText = try XCTUnwrap(selected?.text)
+        let remainingText = selectedText == "はい" ? "会議を始めます" : "はい"
+        let selectedStart = selectedText == "はい" ? 0.0 : 1.5
+        let selectedEnd = selectedText == "はい" ? 0.5 : 3.0
+        let remainingStart = remainingText == "はい" ? 0.0 : 1.5
+        let remainingEnd = remainingText == "はい" ? 0.5 : 3.0
+
+        // When: 選択済み発話を確定し、残りの発話を遅延選択する
+        let finalized = arbiter.submit(
+            candidate(
+                text: selectedText,
+                language: .japanese,
+                confidence: 0.92,
+                isFinal: true,
+                start: selectedStart,
+                end: selectedEnd
+            )
+        )
+        let next = arbiter.selectBestAvailable()
+            ?? arbiter.submit(
+                candidate(
+                    text: remainingText,
+                    language: .japanese,
+                    confidence: 0.91,
+                    start: remainingStart,
+                    end: remainingEnd
+                )
+            )
+
+        // Then: マージで消えていた側の発話も選択できる
+        XCTAssertEqual(finalized?.text, selectedText)
+        XCTAssertEqual(next?.text, remainingText)
+        XCTAssertEqual(next?.startTime, remainingStart)
+    }
+
+    func testLosingLaneUpdateDuringLockDoesNotAbsorbLaterUtterance() {
+        // Given: 短い日本語発話でレーン固定済み
+        var arbiter = BilingualSpeechArbiter()
+        _ = arbiter.submit(
+            candidate(
+                text: "hello noise",
+                language: .english,
+                confidence: 0.4,
+                start: 0,
+                end: 1
+            )
+        )
+        let locked = arbiter.submit(
+            candidate(
+                text: "はい",
+                language: .japanese,
+                confidence: 0.9,
+                start: 0,
+                end: 0.5
+            )
+        )
+        XCTAssertEqual(locked?.text, "はい")
+        XCTAssertEqual(arbiter.activeLanguage, .japanese)
+
+        // When: 固定中に敗者レーンが長大rangeへ更新し、その直後に次発話が届く
+        XCTAssertNil(
+            arbiter.submit(
+                candidate(
+                    text: "incorrect long range",
+                    language: .english,
+                    confidence: 0.3,
+                    start: 0,
+                    end: 10
+                )
+            )
+        )
+        let absorbed = arbiter.submit(
+            candidate(
+                text: "会議を始めます",
+                language: .japanese,
+                confidence: 0.9,
+                start: 1.5,
+                end: 3
+            )
+        )
+
+        // Then: 固定中の別発話を同一発話へ取り込まず、確定後に独立して選べる
+        XCTAssertNil(absorbed)
+        XCTAssertEqual(arbiter.pendingRangeCount, 2)
+
+        let finalized = arbiter.submit(
+            candidate(
+                text: "はい",
+                language: .japanese,
+                confidence: 0.92,
+                isFinal: true,
+                start: 0,
+                end: 0.5
+            )
+        )
+        let next = arbiter.submit(
+            candidate(
+                text: "meeting filler",
+                language: .english,
+                confidence: 0.35,
+                start: 1.5,
+                end: 3
+            )
+        )
+
+        XCTAssertEqual(finalized?.text, "はい")
+        XCTAssertEqual(next?.text, "会議を始めます")
+        XCTAssertEqual(next?.startTime, 1.5)
+    }
+
     private func candidate(
         text: String? = nil,
         language: SpokenLanguage,
