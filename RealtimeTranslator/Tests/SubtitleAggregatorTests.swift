@@ -260,4 +260,64 @@ final class SubtitleAggregatorTests: XCTestCase {
         XCTAssertEqual(whitespaceTranslation.current.translatedText, "Live translation")
         XCTAssertEqual(whitespaceTranslation.current.state, .live)
     }
+
+    func testFinalizesPairWhenSourceExceedsMaxJapaneseLength() {
+        // Given: 日本語上限を短くし、アイドル確定を事実上無効化した集約器
+        var config = SubtitleAggregatorConfig()
+        config.maxJapaneseCharacters = 10
+        config.idleFinalizeInterval = 100
+        let aggregator = SubtitleAggregator(config: config)
+        let now = Date()
+
+        // When: 上限超過の原文と、句点のない訳文を追加する
+        _ = aggregator.appendSource("あいうえおかきくけこさ", now: now)
+        let snapshot = aggregator.appendTranslation("Too long source", now: now)
+
+        // Then: 句点やアイドルを待たず長さ超過でその場確定する
+        XCTAssertEqual(snapshot.current.sourceText.count, 11)
+        XCTAssertEqual(snapshot.current.state, .finalized)
+    }
+
+    func testFinalizesPairWhenTranslationExceedsMaxEnglishLength() {
+        // Given: 英語上限を短くし、アイドル確定を事実上無効化した集約器
+        var config = SubtitleAggregatorConfig()
+        config.maxEnglishCharacters = 20
+        config.idleFinalizeInterval = 100
+        let aggregator = SubtitleAggregator(config: config)
+        let now = Date()
+        let longTranslation = String(repeating: "a", count: 21)
+
+        // When: 短い原文と上限超過の英訳を追加する
+        _ = aggregator.appendSource("短い原文", now: now)
+        let snapshot = aggregator.appendTranslation(longTranslation, now: now)
+
+        // Then: 訳文長超過でもペアをその場確定する
+        XCTAssertEqual(snapshot.current.translatedText.count, 21)
+        XCTAssertEqual(snapshot.current.state, .finalized)
+    }
+
+    func testAppendSourceAfterFinalizedStartsNewLiveUtterance() {
+        // Given: currentにその場確定ペアがある集約器
+        let aggregator = SubtitleAggregator()
+        let now = Date()
+        _ = aggregator.finalizePair(
+            sourceText: "確定文",
+            translatedText: "Finalized.",
+            clearCurrent: true,
+            now: now
+        )
+
+        // When: appendSourceで次発話の原文deltaが届く
+        let snapshot = aggregator.appendSource(
+            "次の発話",
+            now: now.addingTimeInterval(1)
+        )
+
+        // Then: 確定ペアを履歴へ残さず上書きし、訳文なしのliveへ戻す
+        XCTAssertEqual(snapshot.current.sourceText, "次の発話")
+        XCTAssertEqual(snapshot.current.translatedText, "")
+        XCTAssertEqual(snapshot.current.state, .live)
+        XCTAssertFalse(snapshot.current.isTranslationCurrent)
+        XCTAssertFalse(snapshot.current.canFinalize)
+    }
 }
