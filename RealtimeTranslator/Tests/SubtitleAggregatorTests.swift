@@ -226,6 +226,31 @@ final class SubtitleAggregatorTests: XCTestCase {
         XCTAssertTrue(snapshot.current.isEmpty)
     }
 
+    func testIdleTickDoesNotFinalizeWhenTranslationIsStale() {
+        // Given: 旧訳文を残したまま原文だけが進んだライブ字幕
+        var config = SubtitleAggregatorConfig()
+        config.idleFinalizeInterval = 0.2
+        let aggregator = SubtitleAggregator(config: config)
+        let now = Date()
+        _ = aggregator.replaceCurrent(
+            sourceText: "更新された原文",
+            translatedText: "古い訳文です。",
+            isTranslationCurrent: false,
+            canFinalize: false,
+            now: now
+        )
+
+        // When: アイドル確定間隔を超えてtickする
+        let snapshot = aggregator.tick(now: now.addingTimeInterval(1))
+
+        // Then: canFinalize=falseの旧訳文では確定せずliveを維持する
+        XCTAssertEqual(snapshot.current.sourceText, "更新された原文")
+        XCTAssertEqual(snapshot.current.translatedText, "古い訳文です。")
+        XCTAssertEqual(snapshot.current.state, .live)
+        XCTAssertFalse(snapshot.current.isTranslationCurrent)
+        XCTAssertFalse(snapshot.current.canFinalize)
+    }
+
     func testFinalizePairRejectsEmptyOrWhitespaceTranslation() {
         // Given: ライブペアを表示中の字幕集約器
         let aggregator = SubtitleAggregator()

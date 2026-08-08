@@ -730,6 +730,45 @@ final class InterpretationSessionTests: XCTestCase {
             "Sentence before failure"
         )
     }
+
+    func testClosingStateIgnoresVolatileButAcceptsFinalTranscription() async throws {
+        // Given: closing中に停止処理が一時停止しているセッション
+        let speechService = FakeSpeechRecognitionService()
+        speechService.suspendsStop = true
+        let translationService = FakeTranslationService()
+        translationService.translations["停止時の確定。"] = "Finalized on stop"
+        let delegate = InterpretationSessionDelegateSpy()
+        let session = InterpretationSession(
+            translationService: translationService,
+            speechService: speechService
+        )
+        session.delegate = delegate
+        await session.start()
+        speechService.emit(text: "録音中の文", language: .japanese, isFinal: false)
+        await delegate.waitUntilCurrentSource("録音中の文")
+        let stopTask = Task { await session.stop() }
+        await speechService.waitUntilStopCalled()
+        XCTAssertEqual(session.state, .closing)
+        let snapshotCountBeforeClosingUpdates = delegate.snapshots.count
+
+        // When: closing中にvolatileとfinalの認識結果が届く
+        speechService.emit(text: "途中の更新", language: .japanese, isFinal: false)
+        XCTAssertEqual(delegate.snapshots.count, snapshotCountBeforeClosingUpdates)
+        XCTAssertEqual(delegate.lastSnapshot?.current.sourceText, "録音中の文")
+        speechService.emit(text: "停止時の確定", language: .japanese, isFinal: true)
+        await translationService.waitUntilFinalRequested("停止時の確定。")
+        speechService.resumeStop()
+        await stopTask.value
+
+        // Then: volatileは捨て、closing中のfinalだけを確定ペアとして残す
+        XCTAssertEqual(session.state, .idle)
+        let snapshot = try XCTUnwrap(delegate.lastSnapshot)
+        XCTAssertEqual(snapshot.current.sourceText, "停止時の確定")
+        XCTAssertEqual(snapshot.current.translatedText, "Finalized on stop")
+        XCTAssertEqual(snapshot.current.state, .finalized)
+        XCTAssertFalse(translationService.liveRequests.contains("途中の更新"))
+        XCTAssertEqual(translationService.finalRequests, ["停止時の確定。"])
+    }
 }
 
 @MainActor

@@ -561,6 +561,80 @@ final class BilingualSpeechArbiterTests: XCTestCase {
         XCTAssertEqual(next?.startTime, 2)
     }
 
+    func testMergedSameLanguageBucketsPreferFinalCandidateText() {
+        // Given: 近い開始時刻で別バケットになった同一日本語レーンの候補
+        var arbiter = BilingualSpeechArbiter()
+        _ = arbiter.submit(
+            candidate(
+                text: "暫定",
+                language: .japanese,
+                confidence: 0.7,
+                start: 0,
+                end: 0.4
+            )
+        )
+        _ = arbiter.submit(
+            candidate(
+                text: "draft",
+                language: .english,
+                confidence: 0.2,
+                start: 0,
+                end: 0.4
+            )
+        )
+        XCTAssertEqual(arbiter.activeLanguage, .japanese)
+
+        // When: nearStartToleranceで重なる後続日本語finalが届き、バケットが統合される
+        let selected = arbiter.submit(
+            candidate(
+                text: "確定文",
+                language: .japanese,
+                confidence: 0.9,
+                isFinal: true,
+                start: 0.05,
+                end: 0.9
+            )
+        )
+
+        // Then: 同一レーンの統合時はfinalテキストを採用して確定する
+        XCTAssertEqual(selected?.text, "確定文")
+        XCTAssertEqual(selected?.isFinal, true)
+        XCTAssertNil(arbiter.activeLanguage)
+        XCTAssertFalse(arbiter.hasPendingCandidates)
+    }
+
+    func testSelectBestAvailableReturnsNilWhileLaneIsLocked() {
+        // Given: 既に日本語レーンを固定中の判定器
+        var arbiter = BilingualSpeechArbiter()
+        _ = arbiter.submit(candidate(language: .english, confidence: 0.3))
+        _ = arbiter.submit(candidate(language: .japanese, confidence: 0.9))
+        XCTAssertEqual(arbiter.activeLanguage, .japanese)
+        _ = arbiter.submit(
+            candidate(
+                language: .japanese,
+                confidence: 0.95,
+                start: 2,
+                end: 3
+            )
+        )
+        _ = arbiter.submit(
+            candidate(
+                language: .english,
+                confidence: 0.4,
+                start: 2,
+                end: 3
+            )
+        )
+
+        // When: レーン固定中に期限切れ選択を呼ぶ
+        let selected = arbiter.selectBestAvailable()
+
+        // Then: 固定中は次区間を選ばず、表示言語の往復を防ぐ
+        XCTAssertNil(selected)
+        XCTAssertEqual(arbiter.activeLanguage, .japanese)
+        XCTAssertEqual(arbiter.pendingRangeCount, 2)
+    }
+
     private func candidate(
         text: String? = nil,
         language: SpokenLanguage,
