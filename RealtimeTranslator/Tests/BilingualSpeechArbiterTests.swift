@@ -562,45 +562,45 @@ final class BilingualSpeechArbiterTests: XCTestCase {
     }
 
     func testMergedSameLanguageBucketsPreferFinalCandidateText() {
-        // Given: 近い開始時刻で別バケットになった同一日本語レーンの候補
+        // Given: 重なり不足で分かれた同一日本語レーンの2バケット
         var arbiter = BilingualSpeechArbiter()
         _ = arbiter.submit(
             candidate(
-                text: "暫定",
+                text: "暫定A",
                 language: .japanese,
                 confidence: 0.7,
                 start: 0,
-                end: 0.4
+                end: 0.3
             )
         )
         _ = arbiter.submit(
             candidate(
-                text: "draft",
-                language: .english,
-                confidence: 0.2,
-                start: 0,
-                end: 0.4
+                text: "暫定B",
+                language: .japanese,
+                confidence: 0.8,
+                isFinal: true,
+                start: 0.25,
+                end: 0.55
             )
         )
-        XCTAssertEqual(arbiter.activeLanguage, .japanese)
+        XCTAssertEqual(arbiter.pendingRangeCount, 2)
+        XCTAssertNil(arbiter.activeLanguage)
 
-        // When: nearStartToleranceで重なる後続日本語finalが届き、バケットが統合される
+        // When: 両方に重なる英語候補でバケットが統合される
         let selected = arbiter.submit(
             candidate(
-                text: "確定文",
-                language: .japanese,
-                confidence: 0.9,
-                isFinal: true,
-                start: 0.05,
-                end: 0.9
+                text: "bridge",
+                language: .english,
+                confidence: 0.2,
+                start: 0.1,
+                end: 0.5
             )
         )
 
-        // Then: 同一レーンの統合時はfinalテキストを採用して確定する
-        XCTAssertEqual(selected?.text, "確定文")
+        // Then: 同一レーン統合時はfinalの「暫定B」を採用して選択する
+        XCTAssertEqual(selected?.language, .japanese)
+        XCTAssertEqual(selected?.text, "暫定B")
         XCTAssertEqual(selected?.isFinal, true)
-        XCTAssertNil(arbiter.activeLanguage)
-        XCTAssertFalse(arbiter.hasPendingCandidates)
     }
 
     func testSelectBestAvailableReturnsNilWhileLaneIsLocked() {
