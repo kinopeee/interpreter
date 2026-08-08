@@ -515,11 +515,13 @@ final class InterpretationSession {
     }
 
     private func publishCurrentUtterance(isTranslationCurrent: Bool) {
+        // 現在訳だけを確定可能にする。旧訳文の参考表示は canFinalize=false のまま残し、
+        // 停止時 forceFinalize が完全な live ペアを誤って破棄しないようにする。
         let snapshot = aggregator.replaceCurrent(
             sourceText: currentUtterance.sourceText,
             translatedText: currentUtterance.translatedText,
             isTranslationCurrent: isTranslationCurrent,
-            canFinalize: false
+            canFinalize: isTranslationCurrent
         )
         delegate?.interpretationSession(self, didUpdateSubtitles: snapshot)
     }

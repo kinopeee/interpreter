@@ -475,6 +475,39 @@ final class InterpretationSessionTests: XCTestCase {
         await session.stop()
     }
 
+    func testStopKeepsCurrentLiveTranslationPairWhenNoFinalArrives() async throws {
+        // Given: live訳文が現在訳として表示中で、停止時にfinal認識が来ないセッション
+        let speechService = FakeSpeechRecognitionService()
+        let translationService = FakeTranslationService()
+        translationService.translations["話しています"] = "I am speaking"
+        let delegate = InterpretationSessionDelegateSpy()
+        let session = InterpretationSession(
+            translationService: translationService,
+            speechService: speechService
+        )
+        session.delegate = delegate
+        await session.start()
+        speechService.emit(
+            text: "話しています",
+            language: .japanese,
+            isFinal: false
+        )
+        await delegate.waitUntilCurrentTranslation("I am speaking")
+        let live = try XCTUnwrap(delegate.lastSnapshot?.current)
+        XCTAssertTrue(live.isTranslationCurrent)
+        XCTAssertTrue(live.canFinalize)
+
+        // When: final認識なしで録音を停止する
+        await session.stop()
+
+        // Then: 完全なliveペアを破棄せずcurrentへその場確定する
+        let snapshot = try XCTUnwrap(delegate.lastSnapshot)
+        XCTAssertEqual(session.state, .idle)
+        XCTAssertEqual(snapshot.current.sourceText, "話しています")
+        XCTAssertEqual(snapshot.current.translatedText, "I am speaking")
+        XCTAssertEqual(snapshot.current.state, .finalized)
+    }
+
     func testLanguageChangeClearsPreviousTranslation() async throws {
         // Given: 日本語原文のlive訳文を表示中のセッション
         let speechService = FakeSpeechRecognitionService()
