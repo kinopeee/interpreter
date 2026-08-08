@@ -76,4 +76,19 @@ final class TranslationEchoDetectorTests: XCTestCase {
         // Then: 正規化後が空のペアはechoとして扱わない
         XCTAssertFalse(isEcho)
     }
+
+    func testDetectsEchoIgnoringSurroundingWhitespace() {
+        // Given: 前後空白と句点だけが違う未翻訳ペア
+        let source = "  broken speech  "
+        let translated = "broken speech."
+
+        // When: echo判定する
+        let isEcho = TranslationEchoDetector.isEcho(
+            source: source,
+            translated: translated
+        )
+
+        // Then: 空白差を無視して未翻訳echoとして検出する
+        XCTAssertTrue(isEcho)
+    }
 }

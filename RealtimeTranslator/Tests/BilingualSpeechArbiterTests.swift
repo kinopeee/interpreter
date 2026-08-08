@@ -115,6 +115,84 @@ final class BilingualSpeechArbiterTests: XCTestCase {
         XCTAssertNil(arbiter.activeLanguage)
     }
 
+    func testNearStartTolerancePairsNonOverlappingSameUtteranceRanges() {
+        // Given: 重なり率は50%未満だが開始時刻が0.1秒以内の日本語候補
+        var arbiter = BilingualSpeechArbiter()
+        _ = arbiter.submit(
+            candidate(
+                language: .japanese,
+                confidence: 0.9,
+                start: 0,
+                end: 0.15
+            )
+        )
+
+        // When: 終了時刻はずれるが開始が近い英語候補が届く
+        let selected = arbiter.submit(
+            candidate(
+                language: .english,
+                confidence: 0.4,
+                start: 0.08,
+                end: 0.25
+            )
+        )
+
+        // Then: nearStartToleranceで同一発話として束ね、勝者レーンを選ぶ
+        XCTAssertEqual(selected?.language, .japanese)
+        XCTAssertEqual(arbiter.activeLanguage, .japanese)
+    }
+
+    func testMismatchedScriptPenaltyBeatsHigherConfidenceOppositeLane() {
+        // Given: 同じ日本語テキストを両レーンが認識し、英語レーンの生信頼度が高い
+        var arbiter = BilingualSpeechArbiter()
+        let japaneseText = "今日は会議です"
+        _ = arbiter.submit(
+            candidate(
+                text: japaneseText,
+                language: .english,
+                confidence: 0.95
+            )
+        )
+
+        // When: 文字種一致の日本語レーンがやや低い信頼度で届く
+        let selected = arbiter.submit(
+            candidate(
+                text: japaneseText,
+                language: .japanese,
+                confidence: 0.75
+            )
+        )
+
+        // Then: 不一致ペナルティにより日本語レーンが勝つ (0.75+0.1 > 0.95-0.15)
+        XCTAssertEqual(selected?.language, .japanese)
+        XCTAssertEqual(arbiter.activeLanguage, .japanese)
+    }
+
+    func testCounterpartEmptyFinalAllowsImmediateSelectionOfPendingLane() {
+        // Given: 日本語候補だけが先に届いている判定器
+        var arbiter = BilingualSpeechArbiter()
+        let pending = arbiter.submit(candidate(language: .japanese, confidence: 0.8))
+        XCTAssertNil(pending)
+        XCTAssertNil(arbiter.activeLanguage)
+
+        // When: 対向レーンが空finalを返し、続いて日本語候補が更新される
+        _ = arbiter.submit(
+            candidate(
+                text: "",
+                language: .english,
+                confidence: 0,
+                isFinal: true
+            )
+        )
+        let selected = arbiter.submit(
+            candidate(language: .japanese, confidence: 0.85)
+        )
+
+        // Then: 対向が空確定したため待機せず日本語レーンを即時選択する
+        XCTAssertEqual(selected?.language, .japanese)
+        XCTAssertEqual(arbiter.activeLanguage, .japanese)
+    }
+
     func testQueuesNextRangeWhileCurrentRangeIsLocked() {
         // Given: 最初の区間で日本語レーンを選択済みの判定器
         var arbiter = BilingualSpeechArbiter()
@@ -481,6 +559,80 @@ final class BilingualSpeechArbiterTests: XCTestCase {
         XCTAssertEqual(finalized?.language, .japanese)
         XCTAssertEqual(next?.language, .japanese)
         XCTAssertEqual(next?.startTime, 2)
+    }
+
+    func testMergedSameLanguageBucketsPreferFinalCandidateText() {
+        // Given: 重なり不足で分かれた同一日本語レーンの2バケット
+        var arbiter = BilingualSpeechArbiter()
+        _ = arbiter.submit(
+            candidate(
+                text: "暫定A",
+                language: .japanese,
+                confidence: 0.7,
+                start: 0,
+                end: 0.3
+            )
+        )
+        _ = arbiter.submit(
+            candidate(
+                text: "暫定B",
+                language: .japanese,
+                confidence: 0.8,
+                isFinal: true,
+                start: 0.25,
+                end: 0.55
+            )
+        )
+        XCTAssertEqual(arbiter.pendingRangeCount, 2)
+        XCTAssertNil(arbiter.activeLanguage)
+
+        // When: 両方に重なる英語候補でバケットが統合される
+        let selected = arbiter.submit(
+            candidate(
+                text: "bridge",
+                language: .english,
+                confidence: 0.2,
+                start: 0.1,
+                end: 0.5
+            )
+        )
+
+        // Then: 同一レーン統合時はfinalの「暫定B」を採用して選択する
+        XCTAssertEqual(selected?.language, .japanese)
+        XCTAssertEqual(selected?.text, "暫定B")
+        XCTAssertEqual(selected?.isFinal, true)
+    }
+
+    func testSelectBestAvailableReturnsNilWhileLaneIsLocked() {
+        // Given: 既に日本語レーンを固定中の判定器
+        var arbiter = BilingualSpeechArbiter()
+        _ = arbiter.submit(candidate(language: .english, confidence: 0.3))
+        _ = arbiter.submit(candidate(language: .japanese, confidence: 0.9))
+        XCTAssertEqual(arbiter.activeLanguage, .japanese)
+        _ = arbiter.submit(
+            candidate(
+                language: .japanese,
+                confidence: 0.95,
+                start: 2,
+                end: 3
+            )
+        )
+        _ = arbiter.submit(
+            candidate(
+                language: .english,
+                confidence: 0.4,
+                start: 2,
+                end: 3
+            )
+        )
+
+        // When: レーン固定中に期限切れ選択を呼ぶ
+        let selected = arbiter.selectBestAvailable()
+
+        // Then: 固定中は次区間を選ばず、表示言語の往復を防ぐ
+        XCTAssertNil(selected)
+        XCTAssertEqual(arbiter.activeLanguage, .japanese)
+        XCTAssertEqual(arbiter.pendingRangeCount, 2)
     }
 
     private func candidate(
