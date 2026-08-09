@@ -302,7 +302,7 @@ final class InterpretationSessionTests: XCTestCase {
     }
 
     func testCancellationErrorDoesNotAbandonFollowingFinalTranslation() async {
-        // Given: 確定文AだけがCancellationErrorとなる翻訳キュー
+        // Given: 確定文Aだけが常にCancellationErrorとなり、再試行上限が2のセッション
         let speechService = FakeSpeechRecognitionService()
         let translationService = FakeTranslationService()
         translationService.cancelledFinalTexts.insert("文A。")
@@ -310,7 +310,9 @@ final class InterpretationSessionTests: XCTestCase {
         let delegate = InterpretationSessionDelegateSpy()
         let session = InterpretationSession(
             translationService: translationService,
-            speechService: speechService
+            speechService: speechService,
+            maxFinalTranslationAttempts: 2,
+            finalTranslationRetryDelayNanoseconds: 0
         )
         session.delegate = delegate
         await session.start()
@@ -320,10 +322,39 @@ final class InterpretationSessionTests: XCTestCase {
         speechService.emit(text: "文B", language: .japanese, isFinal: true)
         await delegate.waitUntilCurrentTranslation("Sentence B")
 
-        // Then: 文Aの取消後も文Bを処理してその場確定表示する
-        XCTAssertEqual(translationService.finalRequests, ["文A。", "文B。"])
+        // Then: 文Aは取消を再試行上限まで試し、その後も文Bを処理してその場確定表示する
+        XCTAssertEqual(translationService.finalRequests, ["文A。", "文A。", "文B。"])
         XCTAssertEqual(delegate.lastSnapshot?.current.translatedText, "Sentence B")
         XCTAssertEqual(delegate.lastSnapshot?.current.state, .finalized)
+        await session.stop()
+    }
+
+    func testRequestLevelCancellationRetriesAndFinalizes() async throws {
+        // Given: 確定翻訳がセッション再起動相当のCancellationErrorを1回だけ返し、2回目で成功する
+        let speechService = FakeSpeechRecognitionService()
+        let translationService = FakeTranslationService()
+        translationService.translations["文A。"] = "Sentence A"
+        translationService.finalCancellationCounts["文A。"] = 1
+        let delegate = InterpretationSessionDelegateSpy()
+        let session = InterpretationSession(
+            translationService: translationService,
+            speechService: speechService,
+            maxFinalTranslationAttempts: 5,
+            finalTranslationRetryDelayNanoseconds: 0
+        )
+        session.delegate = delegate
+        await session.start()
+
+        // When: 確定文Aを1件だけキューへ入れる
+        speechService.emit(text: "文A", language: .japanese, isFinal: true)
+        await delegate.waitUntilCurrentTranslation("Sentence A")
+
+        // Then: request-level cancel後も同じ確定文を再試行し、原文・訳文ペアを失わない
+        XCTAssertEqual(translationService.finalRequests, ["文A。", "文A。"])
+        let snapshot = try XCTUnwrap(delegate.lastSnapshot)
+        XCTAssertEqual(snapshot.current.sourceText, "文A")
+        XCTAssertEqual(snapshot.current.translatedText, "Sentence A")
+        XCTAssertEqual(snapshot.current.state, .finalized)
         await session.stop()
     }
 
@@ -771,6 +802,7 @@ private final class FakeTranslationService: LocalTranslationServicing {
     var suspendedLiveTexts: Set<String> = []
     var suspendedFinalTexts: Set<String> = []
     var cancelledFinalTexts: Set<String> = []
+    var finalCancellationCounts: [String: Int] = [:]
     var finalFailureCounts: [String: Int] = [:]
     private(set) var finalRequests: [String] = []
     private(set) var liveRequests: [String] = []
@@ -802,6 +834,12 @@ private final class FakeTranslationService: LocalTranslationServicing {
             let waiters = finalRequestWaiters.removeValue(forKey: text) ?? []
             for waiter in waiters {
                 waiter.resume()
+            }
+            if let remainingCancellations = finalCancellationCounts[text],
+               remainingCancellations > 0
+            {
+                finalCancellationCounts[text] = remainingCancellations - 1
+                throw CancellationError()
             }
             if cancelledFinalTexts.contains(text) {
                 throw CancellationError()
