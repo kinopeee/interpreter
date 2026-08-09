@@ -452,20 +452,25 @@ final class InterpretationSession {
                     self,
                     didUpdateSubtitles: finalized
                 )
-            } catch is CancellationError {
-                if Task.isCancelled {
-                    finalTranslationQueue.removeAll()
-                    return
-                }
-                // Request-level cancellation (for example translation session restart)
-                // should not abandon later finals already queued behind this one.
-                continue
+            } catch is CancellationError where Task.isCancelled {
+                // Worker自体の取消(停止など)。キューごと破棄して抜ける。
+                finalTranslationQueue.removeAll()
+                return
             } catch {
-                aggregator.setStatusBanner("ローカル翻訳を準備中…")
-                publishSubtitles()
-                AppLogger.general.error(
-                    "Final local translation failed: \(error.localizedDescription, privacy: .public)"
-                )
+                // Request-level CancellationError (translation session restart など) も
+                // 一時失敗と同様に再試行する。捨てると確定ペアが永久に失われる。
+                // 後続キューは先頭再挿入で順序を保つため放棄しない。
+                if !(error is CancellationError) {
+                    aggregator.setStatusBanner("ローカル翻訳を準備中…")
+                    publishSubtitles()
+                    AppLogger.general.error(
+                        "Final local translation failed: \(error.localizedDescription, privacy: .public)"
+                    )
+                } else {
+                    AppLogger.general.notice(
+                        "Final local translation cancelled; retrying after session restart"
+                    )
+                }
 
                 let nextAttemptCount = request.attemptCount + 1
                 guard nextAttemptCount < maxFinalTranslationAttempts else {
