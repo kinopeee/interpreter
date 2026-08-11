@@ -177,6 +177,38 @@ final class InterpretationSessionTests: XCTestCase {
         await session.stop()
     }
 
+    func testEchoFinalKeepsUsableLiveTranslationPair() async throws {
+        // Given: live訳は有効だが、final品質セッションだけが原文echoを返す発話
+        let speechService = FakeSpeechRecognitionService()
+        let translationService = FakeTranslationService()
+        translationService.translations["Google"] = "グーグル"
+        translationService.translations["Google."] = "Google."
+        let delegate = InterpretationSessionDelegateSpy()
+        let session = InterpretationSession(
+            translationService: translationService,
+            speechService: speechService,
+            liveTranslationDisplayHoldNanoseconds: 0
+        )
+        session.delegate = delegate
+        await session.start()
+
+        // When: live訳を表示したあと、同じ原文でfinalがechoになる
+        speechService.emit(text: "Google", language: .english, isFinal: false)
+        await delegate.waitUntilCurrentTranslation("グーグル")
+        let snapshotCountBeforeFinal = delegate.snapshots.count
+        speechService.emit(text: "Google", language: .english, isFinal: true)
+        await delegate.waitUntilSnapshotCount(atLeast: snapshotCountBeforeFinal + 2)
+
+        // Then: echo finalで画面を空にせず、有効なlive対訳をその場確定する
+        let snapshot = try XCTUnwrap(delegate.lastSnapshot)
+        XCTAssertEqual(snapshot.current.sourceText, "Google")
+        XCTAssertEqual(snapshot.current.translatedText, "グーグル")
+        XCTAssertEqual(snapshot.current.state, .finalized)
+        XCTAssertEqual(translationService.finalRequests, ["Google."])
+        XCTAssertFalse(snapshot.current.isEmpty)
+        await session.stop()
+    }
+
     func testLiveTranslationHoldSuppressesIntermediateRewriteUntilFinal() async throws {
         // Given: live訳の表示保持を3秒に設定し、最初のlive訳を表示済みのセッション
         let speechService = FakeSpeechRecognitionService()

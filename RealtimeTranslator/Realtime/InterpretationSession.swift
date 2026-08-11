@@ -420,6 +420,9 @@ final class InterpretationSession {
 
                 // 未翻訳echoは確定表示しない(原文だけの確定はAGENTS.mdの不変条件違反)。
                 // 同じ入力を再翻訳しても同じechoが返るため、リトライもしない。
+                // ただし live 側に既に非echoの訳があるときは、それをその場確定して残す。
+                // final(品質)セッションが固有名詞などで identity を返しても、
+                // 画面上の有効な対訳ペアを消さない。
                 if TranslationEchoDetector.isEcho(
                     source: request.sourceText,
                     translated: translated
@@ -428,14 +431,9 @@ final class InterpretationSession {
                         "Dropping untranslated echo pair from final translation"
                     )
                     if clearsCurrent {
-                        currentUtterance.clearContent()
-                        aggregator.replaceCurrent(
-                            sourceText: "",
-                            translatedText: "",
-                            isTranslationCurrent: false,
-                            canFinalize: false
+                        promoteLivePairOrClearAfterEchoFinal(
+                            sourceText: request.sourceText
                         )
-                        publishSubtitles()
                     }
                     continue
                 }
@@ -512,6 +510,38 @@ final class InterpretationSession {
     private func stopTicker() {
         tickerTask?.cancel()
         tickerTask = nil
+    }
+
+    /// finalが未翻訳echoのとき、既に表示中の非echo live訳があればそれを確定し、
+    /// なければcurrentを空にして原文だけの残骸を残さない。
+    private func promoteLivePairOrClearAfterEchoFinal(sourceText: String) {
+        let liveTranslated = currentUtterance.translatedText
+        let hasUsableLiveTranslation =
+            !liveTranslated.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && !TranslationEchoDetector.isEcho(
+                source: sourceText,
+                translated: liveTranslated
+            )
+
+        if hasUsableLiveTranslation {
+            currentUtterance.clearContent()
+            let finalized = aggregator.finalizePair(
+                sourceText: sourceText,
+                translatedText: liveTranslated,
+                clearCurrent: true
+            )
+            delegate?.interpretationSession(self, didUpdateSubtitles: finalized)
+            return
+        }
+
+        currentUtterance.clearContent()
+        aggregator.replaceCurrent(
+            sourceText: "",
+            translatedText: "",
+            isTranslationCurrent: false,
+            canFinalize: false
+        )
+        publishSubtitles()
     }
 
     private func publishCurrentUtterance(isTranslationCurrent: Bool) {
