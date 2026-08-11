@@ -50,25 +50,29 @@ protocol LocalTranslationServicing: AnyObject {
     ) async throws -> String
 }
 
-/// 日→英と英→日それぞれにlive/finalの2レーンを持つローカル翻訳サービス。
+/// 原文の言語ごとにlive/finalの2レーンを持つローカル翻訳サービス。
 /// liveは低遅延、finalは品質優先のセッションへ振り分ける。
 /// 各レーンのワーカーは`LocalTranslationHostView`の`translationTask`から起動される。
+///
+/// 翻訳先は言語ペアが決めるため、レーンは原文言語と優先度だけで識別する。
 @MainActor
 final class LocalTranslationService: LocalTranslationServicing {
-    private let jaToEnLiveLane: TranslationLane
-    private let jaToEnFinalLane: TranslationLane
-    private let enToJaLiveLane: TranslationLane
-    private let enToJaFinalLane: TranslationLane
+    private struct LaneKey: Hashable {
+        let source: SpokenLanguage
+        let priority: LocalTranslationPriority
+    }
 
-    /// final(品質優先)セッションの準備状態。liveセッションの状態は含めない。
-    private(set) var isJapaneseToEnglishReady = false
-    private(set) var isEnglishToJapaneseReady = false
+    private let maxPendingFinals: Int
+    private var lanes: [LaneKey: TranslationLane] = [:]
+    /// final(品質優先)セッションを準備できた原文言語。liveセッションの状態は含めない。
+    private(set) var readyFinalSources: Set<SpokenLanguage> = []
 
     init(maxPendingFinals: Int = 32) {
-        jaToEnLiveLane = TranslationLane(finalCapacity: maxPendingFinals)
-        jaToEnFinalLane = TranslationLane(finalCapacity: maxPendingFinals)
-        enToJaLiveLane = TranslationLane(finalCapacity: maxPendingFinals)
-        enToJaFinalLane = TranslationLane(finalCapacity: maxPendingFinals)
+        self.maxPendingFinals = maxPendingFinals
+    }
+
+    func isFinalReady(source: SpokenLanguage) -> Bool {
+        readyFinalSources.contains(source)
     }
 
     func translate(
@@ -78,9 +82,12 @@ final class LocalTranslationService: LocalTranslationServicing {
     ) async throws -> String {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return "" }
+        guard language != .unknown else {
+            throw LocalTranslationError.sessionUnavailable
+        }
 
         let request = PendingTranslationRequest(text: trimmed, priority: priority)
-        let lane = try lane(for: language, priority: priority)
+        let lane = lane(source: language, priority: priority)
 
         return try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { continuation in
@@ -95,78 +102,49 @@ final class LocalTranslationService: LocalTranslationServicing {
         }
     }
 
-    func runJapaneseToEnglishLive(session: TranslationSession) async {
-        await runJapaneseToEnglishLive(
+    /// 指定方向の翻訳セッションを消費し、そのレーンのワーカーとして動き続ける。
+    func run(
+        source: SpokenLanguage,
+        priority: LocalTranslationPriority,
+        session: TranslationSession
+    ) async {
+        await run(
+            source: source,
+            priority: priority,
             driver: AppleTranslationSessionDriver(session: session)
         )
     }
 
-    func runJapaneseToEnglishLive(driver: any LocalTranslationSessionDriving) async {
+    func run(
+        source: SpokenLanguage,
+        priority: LocalTranslationPriority,
+        driver: any LocalTranslationSessionDriving
+    ) async {
         await run(
             driver: driver,
-            lane: jaToEnLiveLane,
-            markReady: { _ in }
-        )
-    }
-
-    func runJapaneseToEnglishFinal(session: TranslationSession) async {
-        await runJapaneseToEnglishFinal(
-            driver: AppleTranslationSessionDriver(session: session)
-        )
-    }
-
-    func runJapaneseToEnglishFinal(driver: any LocalTranslationSessionDriving) async {
-        await run(
-            driver: driver,
-            lane: jaToEnFinalLane,
-            markReady: { self.isJapaneseToEnglishReady = $0 }
-        )
-    }
-
-    func runEnglishToJapaneseLive(session: TranslationSession) async {
-        await runEnglishToJapaneseLive(
-            driver: AppleTranslationSessionDriver(session: session)
-        )
-    }
-
-    func runEnglishToJapaneseLive(driver: any LocalTranslationSessionDriving) async {
-        await run(
-            driver: driver,
-            lane: enToJaLiveLane,
-            markReady: { _ in }
-        )
-    }
-
-    func runEnglishToJapaneseFinal(session: TranslationSession) async {
-        await runEnglishToJapaneseFinal(
-            driver: AppleTranslationSessionDriver(session: session)
-        )
-    }
-
-    func runEnglishToJapaneseFinal(driver: any LocalTranslationSessionDriving) async {
-        await run(
-            driver: driver,
-            lane: enToJaFinalLane,
-            markReady: { self.isEnglishToJapaneseReady = $0 }
+            lane: lane(source: source, priority: priority),
+            markReady: { [weak self] isReady in
+                guard priority == .final, let self else { return }
+                if isReady {
+                    self.readyFinalSources.insert(source)
+                } else {
+                    self.readyFinalSources.remove(source)
+                }
+            }
         )
     }
 
     private func lane(
-        for language: SpokenLanguage,
+        source: SpokenLanguage,
         priority: LocalTranslationPriority
-    ) throws -> TranslationLane {
-        switch (language, priority) {
-        case (.japanese, .live):
-            return jaToEnLiveLane
-        case (.japanese, .final):
-            return jaToEnFinalLane
-        case (.english, .live):
-            return enToJaLiveLane
-        case (.english, .final):
-            return enToJaFinalLane
-        case (.unknown, _):
-            throw LocalTranslationError.sessionUnavailable
+    ) -> TranslationLane {
+        let key = LaneKey(source: source, priority: priority)
+        if let lane = lanes[key] {
+            return lane
         }
+        let lane = TranslationLane(finalCapacity: maxPendingFinals)
+        lanes[key] = lane
+        return lane
     }
 
     private func run(
@@ -174,10 +152,14 @@ final class LocalTranslationService: LocalTranslationServicing {
         lane: TranslationLane,
         markReady: @escaping (Bool) -> Void
     ) async {
-        let signals = lane.beginRun()
+        let laneRun = lane.beginRun()
         defer {
-            markReady(false)
-            lane.endRun()
+            // 言語ペア変更で次のワーカーへ置き換わっている場合は、
+            // 後始末が新しいワーカーの準備状態やキューを壊さないようにする。
+            if lane.isCurrent(laneRun) {
+                markReady(false)
+                lane.endRun(laneRun)
+            }
         }
 
         var isPrepared: Bool
@@ -189,7 +171,7 @@ final class LocalTranslationService: LocalTranslationServicing {
         }
         guard !Task.isCancelled else { return }
 
-        for await _ in signals {
+        for await _ in laneRun.signals {
             let shouldContinue = await drainQueue(
                 driver: driver,
                 lane: lane,

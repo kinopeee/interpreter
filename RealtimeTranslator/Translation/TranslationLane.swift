@@ -115,7 +115,22 @@ final class CoalescingTranslationWakeSignal {
     }
 }
 
-/// 翻訳方向(日→英 / 英→日)ごとの依頼キューと実行中作業の管理。
+/// レーン消費者(翻訳セッションのワーカー)1回分の駆動。
+///
+/// 言語ペアを変えるとSwiftUIが`translationTask`を張り直し、古いワーカーの後始末が
+/// 新しいワーカーの開始より後になり得る。世代で識別して取り違えを防ぐ。
+@MainActor
+final class TranslationLaneRun {
+    let signals: AsyncStream<Void>
+    fileprivate let generation: Int
+
+    fileprivate init(signals: AsyncStream<Void>, generation: Int) {
+        self.signals = signals
+        self.generation = generation
+    }
+}
+
+/// 翻訳方向ごとの依頼キューと実行中作業の管理。
 /// スケジューリング(`LatestTranslationScheduler`)と起床(`CoalescingTranslationWakeSignal`)を
 /// 束ね、final依頼によるlive作業の横取り(preempt)もここで行う。
 @MainActor
@@ -128,22 +143,37 @@ final class TranslationLane {
     private var scheduler: LatestTranslationScheduler<PendingTranslationRequest>
     private var wakeSignal: CoalescingTranslationWakeSignal?
     private var activeWork: ActiveWork?
+    private var runGeneration = 0
 
     init(finalCapacity: Int) {
         scheduler = LatestTranslationScheduler(finalCapacity: finalCapacity)
     }
 
-    func beginRun() -> AsyncStream<Void> {
-        precondition(wakeSignal == nil, "Translation lane already has a consumer")
+    /// 新しい消費者を登録する。既存の消費者がいる場合は打ち切って置き換える。
+    func beginRun() -> TranslationLaneRun {
+        if let previousWakeSignal = wakeSignal {
+            previousWakeSignal.finish()
+            cancelAll()
+        }
+        runGeneration += 1
         let wakeSignal = CoalescingTranslationWakeSignal()
         self.wakeSignal = wakeSignal
         if !scheduler.isEmpty {
             wakeSignal.send()
         }
-        return wakeSignal.stream
+        return TranslationLaneRun(
+            signals: wakeSignal.stream,
+            generation: runGeneration
+        )
     }
 
-    func endRun() {
+    func isCurrent(_ run: TranslationLaneRun) -> Bool {
+        run.generation == runGeneration
+    }
+
+    /// 消費者を解除する。すでに次の消費者へ置き換わっている場合は何もしない。
+    func endRun(_ run: TranslationLaneRun) {
+        guard isCurrent(run) else { return }
         wakeSignal?.finish()
         wakeSignal = nil
         cancelAll()

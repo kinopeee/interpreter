@@ -78,6 +78,62 @@ final class TranslationSourceNormalizerTests: XCTestCase {
         XCTAssertEqual(normalized, "I think so.")
     }
 
+    func testAppendsSpanishPeriodWhenMissing() {
+        // Given: 終端句読点のないスペイン語文
+        let source = "Buenos días"
+
+        // When: final訳向けに正規化する
+        let normalized = TranslationSourceNormalizer.normalizeForFinalTranslation(
+            source,
+            language: .spanish
+        )
+
+        // Then: 文末に「.」を付ける
+        XCTAssertEqual(normalized, "Buenos días.")
+    }
+
+    func testKeepsSpanishExclamationAsTerminalPunctuation() {
+        // Given: スペイン語の感嘆符で終わる文
+        let source = "¡Hasta luego!"
+
+        // When: final訳向けに正規化する
+        let normalized = TranslationSourceNormalizer.normalizeForFinalTranslation(
+            source,
+            language: .spanish
+        )
+
+        // Then: 句読点を重ねず元の終端を維持する
+        XCTAssertEqual(normalized, "¡Hasta luego!")
+    }
+
+    func testRemovesLeadingSpanishFiller() {
+        // Given: 文頭にフィラーとカンマがあるスペイン語文
+        let source = "Pues, vamos a empezar"
+
+        // When: final訳向けに正規化する
+        let normalized = TranslationSourceNormalizer.normalizeForFinalTranslation(
+            source,
+            language: .spanish
+        )
+
+        // Then: 文頭フィラーを除去し、句読点を補う
+        XCTAssertEqual(normalized, "vamos a empezar.")
+    }
+
+    func testKeepsSpanishWordThatOnlyStartsWithFiller() {
+        // Given: フィラー「este」と同じ綴りで始まるが別語である文
+        let source = "Esteban es mi amigo"
+
+        // When: final訳向けに正規化する
+        let normalized = TranslationSourceNormalizer.normalizeForFinalTranslation(
+            source,
+            language: .spanish
+        )
+
+        // Then: 語の途中まで一致しても除去しない
+        XCTAssertEqual(normalized, "Esteban es mi amigo.")
+    }
+
     func testFallsBackWhenFillerRemovalEmptiesText() {
         // Given: フィラーだけの日本語入力
         let source = "えーと"

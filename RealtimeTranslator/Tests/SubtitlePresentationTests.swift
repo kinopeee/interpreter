@@ -219,7 +219,8 @@ final class SubtitlePresentationTests: XCTestCase {
                 .map(ObjectIdentifier.init)
         )
         let controller = SubtitleWindowController(
-            translationService: LocalTranslationService()
+            translationService: LocalTranslationService(),
+            languagePair: .japaneseEnglish
         )
         defer { controller.tearDown() }
         let longText = Array(
@@ -266,7 +267,8 @@ final class SubtitlePresentationTests: XCTestCase {
                 .map(ObjectIdentifier.init)
         )
         let controller = SubtitleWindowController(
-            translationService: LocalTranslationService()
+            translationService: LocalTranslationService(),
+            languagePair: .japaneseEnglish
         )
         defer { controller.tearDown() }
         controller.update(

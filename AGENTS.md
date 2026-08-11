@@ -2,17 +2,21 @@
 
 ## 目的と不変条件
 
-- macOS 26以降向けの、ローカル完結型リアルタイム日英字幕アプリである。
+- macOS 26以降向けの、ローカル完結型リアルタイム字幕アプリである。
 - 音声・原文・訳文を外部サービスへ送信しない。OpenAI、WebSocket、外部翻訳APIを追加しない。
 - 通信は初回のApple製音声認識・翻訳モデル取得に限る。APIキーやネットワーク権限は不要。
-- 日本語音声は英語、英語音声は日本語へ自動翻訳し、原文と訳文を常にペア表示する。
+- 対応言語ペアは`ja-en` / `ja-es` / `en-es`の3つで、設定から1つ選ぶ。ペア内は常に双方向へ自動翻訳し、原文と訳文を常にペア表示する。
+- 言語ペアの変更は待機中にのみ適用する。録音中は認識レーンと翻訳セッションを張り直さない。
 
 ## 構成
 
 - `App/`: AppKitライフサイクルと全体調停。SwiftUI `App`へ戻さない。
-- `Audio/LocalSpeechRecognitionService.swift`: AVAudioEngine、SpeechAnalyzer、日英2レーン。
-- `Audio/SpokenLanguage.swift`: 言語判定と文単位のレーン固定。
-- `Translation/LocalTranslationService.swift`: SwiftUI `translationTask`に結び付いた2方向のApple Translation。
+- `Audio/LocalSpeechRecognitionService.swift`: AVAudioEngine、SpeechAnalyzer、ペアの2レーン。
+- `Audio/LanguagePair.swift`: 言語ペアと翻訳方向の正本。
+- `Audio/SpokenLanguage.swift`: 対応言語とロケール識別子。
+- `Audio/SpokenLanguageDetector.swift`: ペア文脈での言語判定。
+- `Audio/BilingualSpeechArbiter.swift`: 文単位のレーン固定。
+- `Translation/LocalTranslationService.swift`: SwiftUI `translationTask`に結び付いた2方向のApple Translation。レーンは原文言語と優先度で識別する。
 - `Realtime/InterpretationSession.swift`: 認識、表示スロットリング、翻訳、状態遷移を統合。
 - `Subtitles/`: 単一current字幕集約、透明オーバーレイ、録音コントロール。
 - `project.yml`: XcodeGen設定、Info.plist項目、権限説明の正本。
@@ -31,11 +35,13 @@
 
 ## SpeechとTranslationの制約
 
-- `SpeechTranscriber`自体に言語自動判定はない。日英2レーンを同じ`SpeechAnalyzer`で処理する。
+- `SpeechTranscriber`自体に言語自動判定はない。ペアの2レーンを同じ`SpeechAnalyzer`で処理する。
 - `BilingualSpeechArbiter`で選択したレーンは確定結果まで固定し、表示言語の往復を防ぐ。
+- 英語とスペイン語は同じラテン文字のため文字種で判別できない。スペイン語固有の文字・アクセント・排他的な機能語で判定し、確証がなければ`ambiguousLatin`に留めて信頼度へ委ねる。
+- 同一表記のペアでは曖昧さを理由に確定を待たない。待つと字幕が確定まで表示されない。
 - 音声形式を固定値にせず、モデル準備後に`bestAvailableAudioFormat`を取得する。
 - 正常停止は入力を閉じてから`finalizeAndFinishThroughEndOfInput()`を呼ぶ。
-- `TranslationSession`は非Sendableでビュー寿命に依存する。`LocalTranslationHostView`を破棄・再生成しない。
+- `TranslationSession`は非Sendableでビュー寿命に依存する。`LocalTranslationHostView`を破棄・再生成しない。言語ペアの変更は`languagePair`の差し替えだけで行う。
 - `translationTask`内でセッションを使い、キャンセル済みセッションを再利用しない。
 - 翻訳結果は世代番号で照合し、発話更新前の古い結果を画面へ反映しない。
 - リアルタイム用途ではmacOS 26.4以降の`.lowLatency`を優先する。
@@ -82,6 +88,7 @@ xcodebuild test -scheme RealtimeTranslator \
 ## テスト方針
 
 - 純粋ロジックはXCTestで検証し、各テストに日本語のGiven/When/Thenコメントを付ける。
-- 最低限、言語判定、レーン固定と解除、字幕ペア確定、旧訳文での誤確定防止を維持する。
+- 最低限、ペアごとの言語判定、レーン固定と解除、字幕ペア確定、旧訳文での誤確定防止を維持する。
+- 言語証拠の語彙リストは英西で排他であること(共通語を含まないこと)をテストで守る。
 - 非同期境界、空文字、句読点、停止時finalize、多重起動の回帰を優先する。
-- UIや音声経路を変更したら、ビルドと全テストに加えて実際に日英を1文ずつ話して確認する。
+- UIや音声経路を変更したら、ビルドと全テストに加えて、選択ペアの両言語を1文ずつ話して確認する。

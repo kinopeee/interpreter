@@ -4,7 +4,7 @@ import XCTest
 final class BilingualSpeechArbiterTests: XCTestCase {
     func testWaitsForBothLanguageCandidatesBeforeChoosing() {
         // Given: 言語が未確定の判定器
-        var arbiter = BilingualSpeechArbiter()
+        var arbiter = BilingualSpeechArbiter(pair: .japaneseEnglish)
         let japanese = candidate(language: .japanese, confidence: 0.8)
 
         // When: 日本語レーンだけが先に届く
@@ -18,7 +18,7 @@ final class BilingualSpeechArbiterTests: XCTestCase {
 
     func testKeepsSelectedLanguageUntilFinalResult() {
         // Given: 日本語レーンの信頼度が高い同一区間の候補
-        var arbiter = BilingualSpeechArbiter()
+        var arbiter = BilingualSpeechArbiter(pair: .japaneseEnglish)
         _ = arbiter.submit(candidate(language: .english, confidence: 0.45))
         let selected = arbiter.submit(candidate(language: .japanese, confidence: 0.9))
 
@@ -33,7 +33,7 @@ final class BilingualSpeechArbiterTests: XCTestCase {
 
     func testCanChooseOppositeLanguageAfterFinalResult() {
         // Given: 日本語レーンを選択済みの判定器
-        var arbiter = BilingualSpeechArbiter()
+        var arbiter = BilingualSpeechArbiter(pair: .japaneseEnglish)
         _ = arbiter.submit(candidate(language: .english, confidence: 0.4))
         _ = arbiter.submit(candidate(language: .japanese, confidence: 0.9))
 
@@ -52,7 +52,7 @@ final class BilingualSpeechArbiterTests: XCTestCase {
 
     func testIgnoresLateOppositeFinalForFinalizedRange() {
         // Given: 同一区間で日本語レーンを選択し、確定結果まで受信した判定器
-        var arbiter = BilingualSpeechArbiter()
+        var arbiter = BilingualSpeechArbiter(pair: .japaneseEnglish)
         _ = arbiter.submit(candidate(language: .english, confidence: 0.4))
         _ = arbiter.submit(candidate(language: .japanese, confidence: 0.9))
         let finalized = arbiter.submit(
@@ -73,7 +73,7 @@ final class BilingualSpeechArbiterTests: XCTestCase {
 
     func testKeepsSameLanguageCandidatesInSeparateRangeBuckets() {
         // Given: 離れた2区間に日本語候補が先行している判定器
-        var arbiter = BilingualSpeechArbiter()
+        var arbiter = BilingualSpeechArbiter(pair: .japaneseEnglish)
         _ = arbiter.submit(candidate(language: .japanese, confidence: 0.9, start: 0))
         _ = arbiter.submit(candidate(language: .japanese, confidence: 0.8, start: 2))
 
@@ -90,7 +90,7 @@ final class BilingualSpeechArbiterTests: XCTestCase {
 
     func testDoesNotPairNearbyButNonOverlappingRanges() {
         // Given: 開始時刻は1秒以内だが重ならない短い2区間
-        var arbiter = BilingualSpeechArbiter()
+        var arbiter = BilingualSpeechArbiter(pair: .japaneseEnglish)
         _ = arbiter.submit(
             candidate(
                 language: .japanese,
@@ -117,7 +117,7 @@ final class BilingualSpeechArbiterTests: XCTestCase {
 
     func testQueuesNextRangeWhileCurrentRangeIsLocked() {
         // Given: 最初の区間で日本語レーンを選択済みの判定器
-        var arbiter = BilingualSpeechArbiter()
+        var arbiter = BilingualSpeechArbiter(pair: .japaneseEnglish)
         _ = arbiter.submit(candidate(language: .english, confidence: 0.4, start: 0))
         _ = arbiter.submit(candidate(language: .japanese, confidence: 0.9, start: 0))
 
@@ -139,7 +139,7 @@ final class BilingualSpeechArbiterTests: XCTestCase {
 
     func testEmptyVolatileRetractsSelectedRangeWithoutUnlockingLanguage() {
         // Given: 日本語レーンの暫定結果を表示中の判定器
-        var arbiter = BilingualSpeechArbiter()
+        var arbiter = BilingualSpeechArbiter(pair: .japaneseEnglish)
         _ = arbiter.submit(candidate(language: .english, confidence: 0.4))
         _ = arbiter.submit(candidate(language: .japanese, confidence: 0.9))
 
@@ -161,7 +161,7 @@ final class BilingualSpeechArbiterTests: XCTestCase {
 
     func testEmptyFinalUnlocksRangeAndAllowsOppositeLane() {
         // Given: 日本語レーンを選択し、同一区間の英語候補も保持する判定器
-        var arbiter = BilingualSpeechArbiter()
+        var arbiter = BilingualSpeechArbiter(pair: .japaneseEnglish)
         _ = arbiter.submit(candidate(language: .english, confidence: 0.4))
         _ = arbiter.submit(candidate(language: .japanese, confidence: 0.9))
 
@@ -185,7 +185,7 @@ final class BilingualSpeechArbiterTests: XCTestCase {
 
     func testDefersLatinOnlyVolatileCandidatesUntilJapaneseContextArrives() {
         // Given: 日英両レーンが同じLatin単語だけを暫定認識している判定器
-        var arbiter = BilingualSpeechArbiter()
+        var arbiter = BilingualSpeechArbiter(pair: .japaneseEnglish)
         _ = arbiter.submit(
             candidate(text: "Cursor", language: .english, confidence: 0.98)
         )
@@ -208,7 +208,7 @@ final class BilingualSpeechArbiterTests: XCTestCase {
 
     func testAllowsMultiwordEnglishVolatileCandidate() {
         // Given: 複数のLatin単語を含む英語のvolatile候補
-        var arbiter = BilingualSpeechArbiter()
+        var arbiter = BilingualSpeechArbiter(pair: .japaneseEnglish)
         _ = arbiter.submit(
             candidate(text: "Open the file", language: .english, confidence: 0.8)
         )
@@ -224,7 +224,7 @@ final class BilingualSpeechArbiterTests: XCTestCase {
 
     func testAllowsFinalLatinOnlyCandidate() {
         // Given: 言語を単語だけでは断定できないLatin固有名詞の候補
-        var arbiter = BilingualSpeechArbiter()
+        var arbiter = BilingualSpeechArbiter(pair: .japaneseEnglish)
 
         // When: 英語レーンからfinalとして届き、対向レーン待ちの期限を迎える
         let immediate = arbiter.submit(
@@ -246,7 +246,7 @@ final class BilingualSpeechArbiterTests: XCTestCase {
 
     func testComparesOppositeFinalThatArrivesBeforeSelectionDeadline() {
         // Given: 同一区間で信頼度の低い英語finalが先着した判定器
-        var arbiter = BilingualSpeechArbiter()
+        var arbiter = BilingualSpeechArbiter(pair: .japaneseEnglish)
         let early = arbiter.submit(
             candidate(
                 text: "テストです",
@@ -274,7 +274,7 @@ final class BilingualSpeechArbiterTests: XCTestCase {
 
     func testExpandsRangeBucketAsVolatileResultGrows() {
         // Given: 同じ日本語認識が短い区間から長い区間へ成長している判定器
-        var arbiter = BilingualSpeechArbiter()
+        var arbiter = BilingualSpeechArbiter(pair: .japaneseEnglish)
         _ = arbiter.submit(
             candidate(
                 text: "テ",
@@ -313,7 +313,7 @@ final class BilingualSpeechArbiterTests: XCTestCase {
 
     func testDiscardsUnselectedEmptyVolatileBucket() {
         // Given: 候補をまだ選択していない判定器
-        var arbiter = BilingualSpeechArbiter()
+        var arbiter = BilingualSpeechArbiter(pair: .japaneseEnglish)
 
         // When: 空のvolatile結果だけが届く
         let selected = arbiter.submit(
@@ -334,7 +334,7 @@ final class BilingualSpeechArbiterTests: XCTestCase {
 
     func testDiscardsUnselectedSingleLaneEmptyFinalBucket() {
         // Given: 候補をまだ選択していない判定器
-        var arbiter = BilingualSpeechArbiter()
+        var arbiter = BilingualSpeechArbiter(pair: .japaneseEnglish)
 
         // When: 一方のレーンから空finalだけが届く
         _ = arbiter.submit(
@@ -355,7 +355,7 @@ final class BilingualSpeechArbiterTests: XCTestCase {
 
     func testDiscardsActiveSingleLaneBucketAfterEmptyFinal() {
         // Given: 対向候補なしで期限後に日本語レーンを選択した判定器
-        var arbiter = BilingualSpeechArbiter()
+        var arbiter = BilingualSpeechArbiter(pair: .japaneseEnglish)
         _ = arbiter.submit(
             candidate(language: .japanese, confidence: 0.9)
         )
@@ -381,7 +381,7 @@ final class BilingualSpeechArbiterTests: XCTestCase {
 
     func testSkipsUnselectableAmbiguousRangeForLaterClearSpeech() {
         // Given: 先頭に曖昧なLatin一語、後続に明確な英語文がある判定器
-        var arbiter = BilingualSpeechArbiter()
+        var arbiter = BilingualSpeechArbiter(pair: .japaneseEnglish)
         _ = arbiter.submit(
             candidate(
                 text: "Cursor",
@@ -409,7 +409,7 @@ final class BilingualSpeechArbiterTests: XCTestCase {
 
     func testFinalAmbiguousLatinCompetesByConfidence() {
         // Given: 英語一語finalと、同一区間の低信頼度な日本語final
-        var arbiter = BilingualSpeechArbiter()
+        var arbiter = BilingualSpeechArbiter(pair: .japaneseEnglish)
         _ = arbiter.submit(
             candidate(
                 text: "Yes",
@@ -436,7 +436,7 @@ final class BilingualSpeechArbiterTests: XCTestCase {
 
     func testLosingLaneRangeDoesNotFinalizeLaterSpeech() {
         // Given: 勝者の日本語rangeより敗者の英語rangeが大幅に長い候補
-        var arbiter = BilingualSpeechArbiter()
+        var arbiter = BilingualSpeechArbiter(pair: .japaneseEnglish)
         _ = arbiter.submit(
             candidate(
                 text: "incorrect long range",
@@ -481,6 +481,79 @@ final class BilingualSpeechArbiterTests: XCTestCase {
         XCTAssertEqual(finalized?.language, .japanese)
         XCTAssertEqual(next?.language, .japanese)
         XCTAssertEqual(next?.startTime, 2)
+    }
+
+    func testPrefersSpanishLaneWhenSpanishEvidenceContradictsEnglishLane() {
+        // Given: 英西ペアで、英語レーンの方が信頼度の高い同一区間の候補
+        var arbiter = BilingualSpeechArbiter(pair: .englishSpanish)
+        _ = arbiter.submit(
+            candidate(
+                text: "Bamos a la reunion",
+                language: .english,
+                confidence: 0.9
+            )
+        )
+
+        // When: スペイン語レーンの候補が届く
+        let selected = arbiter.submit(
+            candidate(
+                text: "Vamos a la reunión",
+                language: .spanish,
+                confidence: 0.85
+            )
+        )
+
+        // Then: テキストの言語証拠でスペイン語レーンを選ぶ
+        XCTAssertEqual(selected?.language, .spanish)
+        XCTAssertEqual(arbiter.activeLanguage, .spanish)
+    }
+
+    func testSelectsAmbiguousLatinPairCandidateByConfidence() {
+        // Given: 英西ペアで、どちらの言語とも断定できない綴りの候補
+        var arbiter = BilingualSpeechArbiter(pair: .englishSpanish)
+        _ = arbiter.submit(
+            candidate(text: "Madrid", language: .spanish, confidence: 0.9)
+        )
+
+        // When: 対向レーン待ちの期限後として最良候補を選ぶ
+        let selected = arbiter.selectBestAvailable()
+
+        // Then: 同一表記のペアでは確定を待たず、信頼度で暫定表示する
+        XCTAssertEqual(selected?.language, .spanish)
+        XCTAssertFalse(selected?.isFinal == true)
+        XCTAssertEqual(arbiter.activeLanguage, .spanish)
+    }
+
+    func testEmptyFinalUnlocksSpanishLaneAndAllowsEnglishLane() {
+        // Given: 英西ペアでスペイン語レーンを選択し、英語候補も保持する判定器
+        var arbiter = BilingualSpeechArbiter(pair: .englishSpanish)
+        _ = arbiter.submit(
+            candidate(
+                text: "This is a test",
+                language: .english,
+                confidence: 0.4
+            )
+        )
+        _ = arbiter.submit(
+            candidate(
+                text: "Vamos a la reunión",
+                language: .spanish,
+                confidence: 0.9
+            )
+        )
+        XCTAssertEqual(arbiter.activeLanguage, .spanish)
+
+        // When: 選択中のスペイン語レーンが空のfinalへ置き換わる
+        let retraction = arbiter.submit(
+            candidate(text: "", language: .spanish, confidence: 0, isFinal: true)
+        )
+        let replacement = arbiter.selectBestAvailable()
+
+        // Then: ペアの相手レーンとして英語を再選択できる
+        XCTAssertEqual(retraction?.text, "")
+        XCTAssertTrue(retraction?.isFinal == true)
+        XCTAssertEqual(replacement?.language, .english)
+        XCTAssertEqual(arbiter.activeLanguage, .english)
     }
 
     private func candidate(

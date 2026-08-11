@@ -1,35 +1,50 @@
 import Foundation
 
+/// 認識・翻訳の対象言語。`unknown` は判定前と判定不能の両方を表す。
 enum SpokenLanguage: Equatable, Hashable, Sendable {
     case japanese
     case english
+    case spanish
     case unknown
 
-    var translationTarget: TranslationTarget? {
+    /// `SpeechTranscriber` へ渡すロケール識別子。
+    var speechLocaleIdentifier: String? {
         switch self {
         case .japanese:
-            return .english
+            return "ja-JP"
         case .english:
-            return .japanese
+            return "en-US"
+        case .spanish:
+            return "es-ES"
         case .unknown:
             return nil
         }
     }
 
-    /// 日英2レーン構成における相手側レーンの言語。
-    var counterpart: SpokenLanguage {
+    /// Apple Translationのセッション構成へ渡す言語。
+    var translationLanguage: Locale.Language? {
         switch self {
         case .japanese:
-            return .english
+            return Locale.Language(identifier: "ja")
         case .english:
-            return .japanese
+            return Locale.Language(identifier: "en")
+        case .spanish:
+            return Locale.Language(identifier: "es")
         case .unknown:
-            return .unknown
+            return nil
         }
     }
-}
 
-enum TranslationTarget: String, Equatable, Sendable {
-    case english = "en"
-    case japanese = "ja"
+    var displayName: String {
+        switch self {
+        case .japanese:
+            return "日本語"
+        case .english:
+            return "英語"
+        case .spanish:
+            return "スペイン語"
+        case .unknown:
+            return "不明"
+        }
+    }
 }

@@ -1,6 +1,6 @@
 import Foundation
 
-enum LocalTranslationPriority: Sendable {
+enum LocalTranslationPriority: Hashable, Sendable {
     /// 発話途中の暫定訳。常に最新1件だけ保持し、古い依頼は破棄してよい。
     case live
     /// 確定文の訳。取りこぼせないためFIFOで全件処理する(容量上限あり)。

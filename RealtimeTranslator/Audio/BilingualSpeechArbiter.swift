@@ -1,12 +1,12 @@
 import Foundation
 
-/// 日英いずれかの認識レーンが出力した1候補。
+/// 言語ペアいずれかの認識レーンが出力した1候補。
 struct SpeechRecognitionCandidate: Equatable, Sendable {
-    /// 文字種がレーンの言語と一致したときのスコア加点。
+    /// テキストの言語証拠がレーンの言語と一致したときのスコア加点。
     /// 不一致ペナルティ(-0.15)を加点(0.1)より大きくし、
     /// 「日本語文字を含むのに英語レーン」のような明確な誤認識を確実に負かす。
-    private static let matchingScriptBonus = 0.1
-    private static let mismatchedScriptPenalty = -0.15
+    private static let matchingLanguageBonus = 0.1
+    private static let mismatchedLanguagePenalty = -0.15
 
     let text: String
     let language: SpokenLanguage
@@ -15,28 +15,23 @@ struct SpeechRecognitionCandidate: Equatable, Sendable {
     let startTime: Double
     let endTime: Double
 
-    /// レーン選択に使う総合スコア。認識信頼度に文字種の一致度を加味する。
-    var score: Double {
-        let scriptBonus: Double
-        switch SpokenLanguageDetector.evidence(in: text) {
-        case .japanese:
-            scriptBonus = language == .japanese
-                ? Self.matchingScriptBonus : Self.mismatchedScriptPenalty
-        case .english:
-            scriptBonus = language == .english
-                ? Self.matchingScriptBonus : Self.mismatchedScriptPenalty
-        case .ambiguousLatin, .none:
-            scriptBonus = 0
-        }
-        return confidence + scriptBonus
+    /// レーン選択に使う総合スコア。認識信頼度にテキストの言語証拠を加味する。
+    func score(in pair: LanguagePair) -> Double {
+        let detected = SpokenLanguageDetector.detect(text, pair: pair)
+        guard detected != .unknown else { return confidence }
+        return confidence + (
+            detected == language
+                ? Self.matchingLanguageBonus
+                : Self.mismatchedLanguagePenalty
+        )
     }
 
-    var isAmbiguousLatinOnly: Bool {
-        SpokenLanguageDetector.evidence(in: text) == .ambiguousLatin
+    func isAmbiguousLatinOnly(in pair: LanguagePair) -> Bool {
+        SpokenLanguageDetector.evidence(in: text, pair: pair) == .ambiguousLatin
     }
 }
 
-/// 日英2レーンの認識結果から発話区間ごとに勝者レーンを1つ選び、
+/// 言語ペアの2レーンの認識結果から発話区間ごとに勝者レーンを1つ選び、
 /// 確定結果が出るまでそのレーンに固定する(表示言語の往復を防ぐ)。
 ///
 /// - 発話区間は`RangeBucket`として時間範囲で束ね、重なった区間はマージする。
@@ -112,11 +107,16 @@ struct BilingualSpeechArbiter: Sendable {
         }
     }
 
+    private let pair: LanguagePair
     private(set) var activeLanguage: SpokenLanguage?
     private var activeBucketID: Int?
     private var buckets: [RangeBucket] = []
     private var finalizedRanges: [SpeechRange] = []
     private var nextBucketID = 0
+
+    init(pair: LanguagePair) {
+        self.pair = pair
+    }
 
     var hasPendingCandidates: Bool {
         buckets.contains {
@@ -269,7 +269,9 @@ struct BilingualSpeechArbiter: Sendable {
         submitted candidate: SpeechRecognitionCandidate
     ) -> Bool {
         bucket.candidates.count >= 2
-            || bucket.finalizedEmptyLanguages.contains(candidate.language.counterpart)
+            || bucket.finalizedEmptyLanguages.contains(
+                pair.counterpart(of: candidate.language)
+            )
     }
 
     private mutating func selectAndLock(
@@ -278,15 +280,19 @@ struct BilingualSpeechArbiter: Sendable {
         guard let bucket = bucket(withID: bucketID) else { return nil }
         let candidates = Array(bucket.candidates.values)
         guard !candidates.isEmpty else { return nil }
-        guard !candidates.allSatisfy(\.isAmbiguousLatinOnly)
-                || candidates.contains(where: \.isFinal)
-        else {
+        // 文字種で言語を確定できるペアだけ、曖昧なLatin一語の確定を待つ。
+        // 英語とスペイン語のように同一表記のペアでは曖昧な発話が常態のため、
+        // ここで待つと確定するまで字幕が出ない。信頼度による選択へ委ねる。
+        if pair.hasDistinctScripts,
+           candidates.allSatisfy({ $0.isAmbiguousLatinOnly(in: pair) }),
+           !candidates.contains(where: \.isFinal)
+        {
             return nil
         }
 
         let candidatesWithLanguageEvidence = candidates.filter {
-            switch SpokenLanguageDetector.evidence(in: $0.text) {
-            case .japanese, .english:
+            switch SpokenLanguageDetector.evidence(in: $0.text, pair: pair) {
+            case .japanese, .english, .spanish:
                 return true
             case .ambiguousLatin:
                 return $0.isFinal
@@ -297,7 +303,9 @@ struct BilingualSpeechArbiter: Sendable {
         let selectionPool = candidatesWithLanguageEvidence.isEmpty
             ? candidates
             : candidatesWithLanguageEvidence
-        guard let winner = selectionPool.max(by: { $0.score < $1.score }) else {
+        guard let winner = selectionPool.max(by: {
+            $0.score(in: pair) < $1.score(in: pair)
+        }) else {
             return nil
         }
 
@@ -395,8 +403,7 @@ struct BilingualSpeechArbiter: Sendable {
 
     private mutating func removeBucketIfAllLanesFinalizedEmpty(_ bucketID: Int) {
         guard let bucket = bucket(withID: bucketID),
-              bucket.finalizedEmptyLanguages.contains(.japanese),
-              bucket.finalizedEmptyLanguages.contains(.english)
+              pair.languages.allSatisfy({ bucket.finalizedEmptyLanguages.contains($0) })
         else {
             return
         }

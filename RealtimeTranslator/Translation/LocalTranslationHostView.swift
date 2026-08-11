@@ -6,44 +6,50 @@ import SwiftUI
 /// 1x1透明ビュー。`TranslationSession`は非Sendableでビュー寿命に依存するため、
 /// このビューを破棄・再生成してはならない(AGENTS.mdの不変条件)。
 ///
-/// live用(低遅延)とfinal用(品質優先)の4セッションを並行起動する。
+/// 言語ペアの2方向それぞれにlive用(低遅延)とfinal用(品質優先)を持ち、
+/// 4セッションを並行起動する。ペアを変えるときはビューを作り直さず、
+/// `languagePair`だけを差し替えて`translationTask`の構成を更新する。
 struct LocalTranslationHostView: View {
     let service: LocalTranslationService
+    let languagePair: LanguagePair
 
-    private let japanese = Locale.Language(identifier: "ja")
-    private let english = Locale.Language(identifier: "en")
+    private var primary: SpokenLanguage { languagePair.languages[0] }
+    private var secondary: SpokenLanguage { languagePair.languages[1] }
 
     var body: some View {
         Color.clear
             .frame(width: 1, height: 1)
-            .translationTask(japaneseToEnglishLiveConfiguration) { session in
-                await service.runJapaneseToEnglishLive(session: session)
+            .translationTask(configuration(from: primary, priority: .live)) { session in
+                await service.run(source: primary, priority: .live, session: session)
             }
-            .translationTask(japaneseToEnglishFinalConfiguration) { session in
-                await service.runJapaneseToEnglishFinal(session: session)
+            .translationTask(configuration(from: primary, priority: .final)) { session in
+                await service.run(source: primary, priority: .final, session: session)
             }
-            .translationTask(englishToJapaneseLiveConfiguration) { session in
-                await service.runEnglishToJapaneseLive(session: session)
+            .translationTask(configuration(from: secondary, priority: .live)) { session in
+                await service.run(source: secondary, priority: .live, session: session)
             }
-            .translationTask(englishToJapaneseFinalConfiguration) { session in
-                await service.runEnglishToJapaneseFinal(session: session)
+            .translationTask(configuration(from: secondary, priority: .final)) { session in
+                await service.run(source: secondary, priority: .final, session: session)
             }
     }
 
-    private var japaneseToEnglishLiveConfiguration: TranslationSession.Configuration {
-        liveConfiguration(source: japanese, target: english)
-    }
+    private func configuration(
+        from source: SpokenLanguage,
+        priority: LocalTranslationPriority
+    ) -> TranslationSession.Configuration? {
+        guard let target = languagePair.translationTarget(for: source),
+              let sourceLanguage = source.translationLanguage,
+              let targetLanguage = target.translationLanguage
+        else {
+            return nil
+        }
 
-    private var japaneseToEnglishFinalConfiguration: TranslationSession.Configuration {
-        finalConfiguration(source: japanese, target: english)
-    }
-
-    private var englishToJapaneseLiveConfiguration: TranslationSession.Configuration {
-        liveConfiguration(source: english, target: japanese)
-    }
-
-    private var englishToJapaneseFinalConfiguration: TranslationSession.Configuration {
-        finalConfiguration(source: english, target: japanese)
+        switch priority {
+        case .live:
+            return liveConfiguration(source: sourceLanguage, target: targetLanguage)
+        case .final:
+            return finalConfiguration(source: sourceLanguage, target: targetLanguage)
+        }
     }
 
     /// 発話途中の暫定訳向け。macOS 26.4以降は`.lowLatency`を優先する。

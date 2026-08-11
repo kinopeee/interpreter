@@ -11,7 +11,8 @@ final class AppCoordinator: NSObject {
     private var menuBarController: MenuBarController!
     private let localTranslationService = LocalTranslationService()
     private lazy var subtitleWindow = SubtitleWindowController(
-        translationService: localTranslationService
+        translationService: localTranslationService,
+        languagePair: settings.languagePair
     )
     private lazy var interpretationSession = InterpretationSession(
         translationService: localTranslationService
@@ -28,6 +29,7 @@ final class AppCoordinator: NSObject {
             self?.toggleTranslation()
         }
         subtitleWindow.applySavedOrigin(settings.customPanelOrigin())
+        applyLanguagePairIfIdle()
         lastSnapshot = idleSnapshot
         subtitleWindow.update(
             snapshot: idleSnapshot,
@@ -60,7 +62,20 @@ final class AppCoordinator: NSObject {
 
     private func beginTranslation() {
         writeStatusFile("starting")
+        applyLanguagePairIfIdle()
         Task { await interpretationSession.start() }
+    }
+
+    /// 設定の言語ペアを認識・翻訳へ反映する。録音中は認識レーンと翻訳セッションを
+    /// 張り直せないため、待機状態のときだけ適用する。
+    private func applyLanguagePairIfIdle() {
+        switch translationState {
+        case .idle, .error:
+            interpretationSession.languagePair = settings.languagePair
+            subtitleWindow.setLanguagePair(settings.languagePair)
+        case .connecting, .listening, .closing:
+            break
+        }
     }
 
     private func writeStatusFile(_ status: String) {
@@ -84,7 +99,9 @@ final class AppCoordinator: NSObject {
         }
 
         let view = SettingsView(settings: settings) { [weak self] in
-            self?.menuBarController.refresh()
+            guard let self else { return }
+            self.applyLanguagePairIfIdle()
+            self.menuBarController.refresh()
         }
         let hosting = NSHostingController(rootView: view)
         let window = NSWindow(contentViewController: hosting)
@@ -134,6 +151,8 @@ extension AppCoordinator: InterpretationSessionDelegate {
         translationState = state
         menuBarController.refresh()
         writeStatusFile(state.rawValue)
+        // 録音中に変更した言語ペアは、待機状態へ戻ったここで初めて反映する。
+        applyLanguagePairIfIdle()
         if state == .idle, lastSnapshot.current.isEmpty {
             lastSnapshot = idleSnapshot
         }

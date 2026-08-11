@@ -18,10 +18,19 @@ final class AppSettings {
         static let panelOriginX = "panelOriginX"
         static let panelOriginY = "panelOriginY"
         static let hasCustomPanelOrigin = "hasCustomPanelOrigin"
+        static let languagePair = "languagePair"
     }
 
     var fontSize: Double {
         didSet { UserDefaults.standard.set(fontSize, forKey: Keys.fontSize) }
+    }
+
+    /// 原文と訳文の言語ペア。認識レーンと翻訳セッションを張り直す必要があるため、
+    /// 変更は次の録音開始時に反映する。
+    var languagePair: LanguagePair {
+        didSet {
+            UserDefaults.standard.set(languagePair.rawValue, forKey: Keys.languagePair)
+        }
     }
 
     var hasCustomPanelOrigin: Bool {
@@ -40,6 +49,9 @@ final class AppSettings {
         let defaults = UserDefaults.standard
         let storedFont = defaults.double(forKey: Keys.fontSize)
         fontSize = storedFont > 0 ? storedFont : 32
+        languagePair = LanguagePair.from(
+            rawValue: defaults.string(forKey: Keys.languagePair)
+        )
         hasCustomPanelOrigin = defaults.bool(forKey: Keys.hasCustomPanelOrigin)
         panelOriginX = defaults.double(forKey: Keys.panelOriginX)
         panelOriginY = defaults.double(forKey: Keys.panelOriginY)
