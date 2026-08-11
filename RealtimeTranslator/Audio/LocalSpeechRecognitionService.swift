@@ -59,7 +59,7 @@ private enum SpeechAuthorization {
 @MainActor
 protocol LocalSpeechRecognitionServicing: AnyObject {
     var delegate: LocalSpeechRecognitionServiceDelegate? { get set }
-    func start() async throws
+    func start(languagePair: LanguagePair) async throws
     func stop() async
 }
 
@@ -81,8 +81,7 @@ protocol LocalSpeechRecognitionServiceDelegate: AnyObject {
 @MainActor
 private struct RunningSpeechPipeline {
     let analyzer: SpeechAnalyzer
-    let japaneseTranscriber: SpeechTranscriber
-    let englishTranscriber: SpeechTranscriber
+    let transcribers: [LanguageTranscriber]
     let captureContinuation: AsyncStream<CapturedAudioBuffer>.Continuation
     let inputContinuation: AsyncStream<AnalyzerInput>.Continuation
     let feederTask: Task<Void, Never>
@@ -90,11 +89,17 @@ private struct RunningSpeechPipeline {
     let audioConverter: AnalyzerAudioConverter
 }
 
+/// 言語ペアの1レーン分の認識器。レーン数と言語はペアから決まる。
+@MainActor
+private struct LanguageTranscriber {
+    let language: SpokenLanguage
+    let transcriber: SpeechTranscriber
+}
+
 @MainActor
 private final class SpeechStartupResources {
     var analyzer: SpeechAnalyzer?
-    var japaneseTranscriber: SpeechTranscriber?
-    var englishTranscriber: SpeechTranscriber?
+    var transcribers: [LanguageTranscriber] = []
     var captureContinuation: AsyncStream<CapturedAudioBuffer>.Continuation?
     var inputContinuation: AsyncStream<AnalyzerInput>.Continuation?
     var feederTask: Task<Void, Never>?
@@ -104,12 +109,11 @@ private final class SpeechStartupResources {
 
     func promoteToRunning() -> RunningSpeechPipeline {
         guard let analyzer,
-              let japaneseTranscriber,
-              let englishTranscriber,
               let captureContinuation,
               let inputContinuation,
               let feederTask,
               let audioConverter,
+              !transcribers.isEmpty,
               !resultTasks.isEmpty,
               isTapInstalled
         else {
@@ -118,8 +122,7 @@ private final class SpeechStartupResources {
 
         let pipeline = RunningSpeechPipeline(
             analyzer: analyzer,
-            japaneseTranscriber: japaneseTranscriber,
-            englishTranscriber: englishTranscriber,
+            transcribers: transcribers,
             captureContinuation: captureContinuation,
             inputContinuation: inputContinuation,
             feederTask: feederTask,
@@ -127,8 +130,7 @@ private final class SpeechStartupResources {
             audioConverter: audioConverter
         )
         self.analyzer = nil
-        self.japaneseTranscriber = nil
-        self.englishTranscriber = nil
+        transcribers.removeAll()
         self.captureContinuation = nil
         self.inputContinuation = nil
         self.feederTask = nil
@@ -141,8 +143,7 @@ private final class SpeechStartupResources {
 
 @MainActor
 private struct PreparedSpeechModules {
-    let japaneseTranscriber: SpeechTranscriber
-    let englishTranscriber: SpeechTranscriber
+    let transcribers: [LanguageTranscriber]
     let modules: [any SpeechModule]
 }
 
@@ -178,7 +179,7 @@ final class LocalSpeechRecognitionService: LocalSpeechRecognitionServicing {
 
     private let audioEngine = AVAudioEngine()
     private var runningPipeline: RunningSpeechPipeline?
-    private var speechArbiter = BilingualSpeechArbiter()
+    private var speechArbiter = BilingualSpeechArbiter(pair: .default)
     private var languageSelectionTask: Task<Void, Never>?
     /// レーン選択フォールバックタスクの重複起動を防ぐ世代番号。
     /// キャンセル時にインクリメントし、古いタスクが`languageSelectionTask`をnil化するのを防ぐ。
@@ -198,7 +199,7 @@ final class LocalSpeechRecognitionService: LocalSpeechRecognitionServicing {
         }
     }
 
-    func start() async throws {
+    func start(languagePair: LanguagePair) async throws {
         guard lifecycleState == .idle else { return }
         lifecycleGeneration += 1
         let generation = lifecycleGeneration
@@ -208,6 +209,7 @@ final class LocalSpeechRecognitionService: LocalSpeechRecognitionServicing {
         do {
             try await authorizeStartup(generation: generation)
             let preparedModules = try await prepareSpeechModules(
+                languagePair: languagePair,
                 generation: generation,
                 resources: startupResources
             )
@@ -231,7 +233,7 @@ final class LocalSpeechRecognitionService: LocalSpeechRecognitionServicing {
             )
 
             runningPipeline = startupResources.promoteToRunning()
-            speechArbiter.reset()
+            speechArbiter = BilingualSpeechArbiter(pair: languagePair)
             cancelLanguageSelectionTask()
             lastEmittedSignature = nil
             acceptedResultGeneration = generation
@@ -303,6 +305,7 @@ final class LocalSpeechRecognitionService: LocalSpeechRecognitionServicing {
     }
 
     private func prepareSpeechModules(
+        languagePair: LanguagePair,
         generation: Int,
         resources: SpeechStartupResources
     ) async throws -> PreparedSpeechModules {
@@ -310,22 +313,27 @@ final class LocalSpeechRecognitionService: LocalSpeechRecognitionServicing {
             throw LocalSpeechRecognitionError.speechTranscriberUnavailable
         }
         delegate?.localSpeechRecognitionService(
-            didUpdateStatus: "日英音声認識モデルを確認中…"
+            didUpdateStatus: "音声認識モデル（\(languagePair.displayName)）を確認中…"
         )
 
-        let japaneseLocale = try await supportedLocale(identifier: "ja-JP")
-        try ensureStartupIsCurrent(generation)
-        let englishLocale = try await supportedLocale(identifier: "en-US")
-        try ensureStartupIsCurrent(generation)
-
-        let japaneseTranscriber = makeTranscriber(locale: japaneseLocale)
-        let englishTranscriber = makeTranscriber(locale: englishLocale)
-        resources.japaneseTranscriber = japaneseTranscriber
-        resources.englishTranscriber = englishTranscriber
+        var transcribers: [LanguageTranscriber] = []
+        for language in languagePair.languages {
+            guard let identifier = language.speechLocaleIdentifier else {
+                throw LocalSpeechRecognitionError.speechTranscriberUnavailable
+            }
+            let locale = try await supportedLocale(identifier: identifier)
+            try ensureStartupIsCurrent(generation)
+            transcribers.append(
+                LanguageTranscriber(
+                    language: language,
+                    transcriber: makeTranscriber(locale: locale)
+                )
+            )
+        }
+        resources.transcribers = transcribers
         let prepared = PreparedSpeechModules(
-            japaneseTranscriber: japaneseTranscriber,
-            englishTranscriber: englishTranscriber,
-            modules: [japaneseTranscriber, englishTranscriber]
+            transcribers: transcribers,
+            modules: transcribers.map { $0.transcriber as any SpeechModule }
         )
 
         do {
@@ -335,7 +343,7 @@ final class LocalSpeechRecognitionService: LocalSpeechRecognitionServicing {
             try ensureStartupIsCurrent(generation)
             if let request {
                 delegate?.localSpeechRecognitionService(
-                    didUpdateStatus: "日英音声認識モデルをダウンロード中…"
+                    didUpdateStatus: "音声認識モデル（\(languagePair.displayName)）をダウンロード中…"
                 )
                 try await request.downloadAndInstall()
                 try ensureStartupIsCurrent(generation)
@@ -419,8 +427,7 @@ final class LocalSpeechRecognitionService: LocalSpeechRecognitionServicing {
         try ensureStartupIsCurrent(generation)
 
         resources.resultTasks = makeResultTasks(
-            japaneseTranscriber: preparedModules.japaneseTranscriber,
-            englishTranscriber: preparedModules.englishTranscriber,
+            transcribers: preparedModules.transcribers,
             generation: generation
         )
         resources.feederTask = makeFeederTask(
@@ -514,8 +521,7 @@ final class LocalSpeechRecognitionService: LocalSpeechRecognitionServicing {
             await task.value
         }
         resources.resultTasks.removeAll()
-        resources.japaneseTranscriber = nil
-        resources.englishTranscriber = nil
+        resources.transcribers.removeAll()
         resources.audioConverter = nil
     }
 
@@ -546,22 +552,16 @@ final class LocalSpeechRecognitionService: LocalSpeechRecognitionServicing {
     }
 
     private func makeResultTasks(
-        japaneseTranscriber: SpeechTranscriber,
-        englishTranscriber: SpeechTranscriber,
+        transcribers: [LanguageTranscriber],
         generation: Int
     ) -> [Task<Void, Never>] {
-        [
+        transcribers.map { lane in
             makeResultTask(
-                transcriber: japaneseTranscriber,
-                language: .japanese,
+                transcriber: lane.transcriber,
+                language: lane.language,
                 generation: generation
-            ),
-            makeResultTask(
-                transcriber: englishTranscriber,
-                language: .english,
-                generation: generation
-            ),
-        ]
+            )
+        }
     }
 
     private func makeResultTask(

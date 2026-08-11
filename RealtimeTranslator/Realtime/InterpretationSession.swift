@@ -114,6 +114,10 @@ final class InterpretationSession {
         }
     }
 
+    /// 次の録音で使う言語ペア。録音中の認識レーンと翻訳セッションは
+    /// 開始時のペアで組み立てるため、録音中に書き換えても現在の録音へは影響しない。
+    var languagePair: LanguagePair = .default
+
     var isTickerRunning: Bool {
         tickerTask != nil
     }
@@ -131,6 +135,8 @@ final class InterpretationSession {
     /// 古い起動処理が状態を上書きするのを防ぐ。
     private var lifecycleGeneration = 0
     private var currentUtterance = CurrentUtterance()
+    /// 実行中の録音が使っている言語ペア。開始時に`languagePair`から取り込む。
+    private var activeLanguagePair: LanguagePair = .default
 
     init(
         translationService: any LocalTranslationServicing,
@@ -160,6 +166,8 @@ final class InterpretationSession {
         guard state == .idle || state == .error else { return }
         lifecycleGeneration += 1
         let generation = lifecycleGeneration
+        let pair = languagePair
+        activeLanguagePair = pair
         state = .connecting
         aggregator.reset()
         cancelTransientWork()
@@ -170,7 +178,7 @@ final class InterpretationSession {
         publishSubtitles()
 
         do {
-            try await speechService.start()
+            try await speechService.start(languagePair: pair)
             guard lifecycleGeneration == generation, state == .connecting else {
                 await speechService.stop()
                 return
@@ -244,7 +252,8 @@ final class InterpretationSession {
         isFinal: Bool
     ) {
         let acceptsTranscription = state == .listening || (state == .closing && isFinal)
-        guard acceptsTranscription, language != .unknown else { return }
+        // 実行中のペア外のレーン(ペア変更前の遅延結果など)は翻訳先が決まらないため捨てる。
+        guard acceptsTranscription, activeLanguagePair.contains(language) else { return }
         guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             retractTranscription(language: language)
             return

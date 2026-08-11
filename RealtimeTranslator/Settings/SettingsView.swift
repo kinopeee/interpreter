@@ -9,9 +9,14 @@ struct SettingsView: View {
             Section("処理方式") {
                 LabeledContent("音声認識", value: "Apple SpeechAnalyzer（端末内）")
                 LabeledContent("翻訳", value: "Apple Translation（端末内）")
-                LabeledContent("翻訳方向", value: "自動（日本語 ↔ 英語）")
+                Picker("言語ペア", selection: $settings.languagePair) {
+                    ForEach(LanguagePair.allCases) { pair in
+                        Text(pair.displayName).tag(pair)
+                    }
+                }
+                LabeledContent("翻訳方向", value: "自動（双方向）")
                 LabeledContent("字幕表示", value: "原文＋翻訳")
-                Text("初回のみ、macOSが日英モデルのダウンロード許可を求めることがあります。音声と字幕は外部へ送信されません。")
+                Text("言語ペアの変更は次回の録音開始時に反映されます。初回のみ、macOSが選択した言語のモデルのダウンロード許可を求めることがあります。音声と字幕は外部へ送信されません。")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -28,7 +33,7 @@ struct SettingsView: View {
             }
         }
         .padding(20)
-        .frame(width: 520, height: 340)
+        .frame(width: 520, height: 400)
         .onDisappear {
             onSave?()
         }

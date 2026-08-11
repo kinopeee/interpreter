@@ -27,6 +27,16 @@ enum TranslationSourceNormalizer {
         "you know",
     ]
 
+    private static let spanishFillers = [
+        "eh",
+        "em",
+        "este",
+        "pues",
+        "bueno",
+        "o sea",
+        "a ver",
+    ]
+
     /// final訳向けにテキストを正規化する。
     /// フィラー除去で空になった場合はトリム済み元テキストへフォールバックする。
     static func normalizeForFinalTranslation(
@@ -49,7 +59,9 @@ enum TranslationSourceNormalizer {
         case .japanese:
             return removeLeadingJapaneseFiller(text)
         case .english:
-            return removeLeadingEnglishFiller(text)
+            return removeLeadingLatinFiller(text, fillers: englishFillers)
+        case .spanish:
+            return removeLeadingLatinFiller(text, fillers: spanishFillers)
         case .unknown:
             return text
         }
@@ -67,8 +79,11 @@ enum TranslationSourceNormalizer {
         return text
     }
 
-    private static func removeLeadingEnglishFiller(_ text: String) -> String {
-        for filler in englishFillers.sorted(by: { $0.count > $1.count }) {
+    private static func removeLeadingLatinFiller(
+        _ text: String,
+        fillers: [String]
+    ) -> String {
+        for filler in fillers.sorted(by: { $0.count > $1.count }) {
             guard let matchRange = text.range(
                 of: #"^\s*"# + NSRegularExpression.escapedPattern(for: filler) + #"(?=[\s,]|$)"#,
                 options: [.regularExpression, .caseInsensitive]
@@ -97,7 +112,7 @@ enum TranslationSourceNormalizer {
         switch language {
         case .japanese:
             return text + "。"
-        case .english:
+        case .english, .spanish:
             return text + "."
         case .unknown:
             return text

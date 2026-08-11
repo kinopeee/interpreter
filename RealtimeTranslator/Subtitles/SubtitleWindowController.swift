@@ -9,6 +9,7 @@ final class SubtitleWindowController: NSObject {
     private let subtitleContainerView: NSView
     private let controlHostingView: NSHostingView<RecordingControlView>
     private let translationHostingView: NSHostingView<LocalTranslationHostView>
+    private let translationService: LocalTranslationService
     private let controlContainerView = NSView()
     private var snapshot = SubtitleSnapshot.empty
     private var fontSize: Double = 32
@@ -20,7 +21,11 @@ final class SubtitleWindowController: NSObject {
     private var dragStartPanelOrigin: NSPoint?
     private var dragStartMouseLocation: NSPoint?
 
-    init(translationService: LocalTranslationService) {
+    init(
+        translationService: LocalTranslationService,
+        languagePair: LanguagePair
+    ) {
+        self.translationService = translationService
         let subtitleView = SubtitleView(
             snapshot: .empty,
             fontSize: 32,
@@ -44,7 +49,10 @@ final class SubtitleWindowController: NSObject {
             rootView: RecordingControlView(state: .idle, onToggleRecording: {})
         )
         translationHostingView = NSHostingView(
-            rootView: LocalTranslationHostView(service: translationService)
+            rootView: LocalTranslationHostView(
+                service: translationService,
+                languagePair: languagePair
+            )
         )
         super.init()
         subtitleContainerView.autoresizesSubviews = true
@@ -112,6 +120,18 @@ final class SubtitleWindowController: NSObject {
         if shouldRenderControls {
             renderControls()
         }
+    }
+
+    /// 翻訳セッションの言語ペアを差し替える。ホスティングビューは作り直さず、
+    /// `translationTask`の構成だけを更新する(AGENTS.mdの不変条件)。
+    func setLanguagePair(_ languagePair: LanguagePair) {
+        guard translationHostingView.rootView.languagePair != languagePair else {
+            return
+        }
+        translationHostingView.rootView = LocalTranslationHostView(
+            service: translationService,
+            languagePair: languagePair
+        )
     }
 
     func setRecordingHandler(_ handler: @escaping () -> Void) {

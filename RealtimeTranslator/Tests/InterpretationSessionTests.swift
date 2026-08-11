@@ -607,6 +607,79 @@ final class InterpretationSessionTests: XCTestCase {
         XCTAssertEqual(delegate.lastSnapshot?.current.state, .finalized)
     }
 
+    func testStartUsesConfiguredLanguagePairForRecognition() async {
+        // Given: 英西ペアを設定したセッション
+        let speechService = FakeSpeechRecognitionService()
+        let translationService = FakeTranslationService()
+        translationService.translations["Buenas tardes."] = "Good afternoon"
+        let delegate = InterpretationSessionDelegateSpy()
+        let session = InterpretationSession(
+            translationService: translationService,
+            speechService: speechService
+        )
+        session.delegate = delegate
+        session.languagePair = .englishSpanish
+
+        // When: 録音を開始してスペイン語の確定文を受け取る
+        await session.start()
+        speechService.emit(text: "Buenas tardes", language: .spanish, isFinal: true)
+        await delegate.waitUntilCurrentTranslation("Good afternoon")
+
+        // Then: 認識へ選択ペアを渡し、スペイン語原文をそのまま翻訳する
+        XCTAssertEqual(speechService.startedLanguagePairs, [.englishSpanish])
+        XCTAssertEqual(translationService.finalRequests, ["Buenas tardes."])
+        XCTAssertEqual(delegate.lastSnapshot?.current.sourceText, "Buenas tardes")
+        await session.stop()
+    }
+
+    func testLanguagePairChangeAppliesOnlyToTheNextRecording() async {
+        // Given: 既定の日英ペアで録音中のセッション
+        let speechService = FakeSpeechRecognitionService()
+        let translationService = FakeTranslationService()
+        let delegate = InterpretationSessionDelegateSpy()
+        let session = InterpretationSession(
+            translationService: translationService,
+            speechService: speechService
+        )
+        session.delegate = delegate
+        await session.start()
+
+        // When: 録音中にペアを変更し、変更前のペアのレーンから認識結果が届く
+        session.languagePair = .englishSpanish
+        speechService.emit(text: "録音中の文", language: .japanese, isFinal: false)
+        await delegate.waitUntilCurrentSource("録音中の文")
+        await session.stop()
+        await session.start()
+
+        // Then: 実行中の録音は元のペアのまま扱い、次の開始で新しいペアを使う
+        XCTAssertEqual(
+            speechService.startedLanguagePairs,
+            [.japaneseEnglish, .englishSpanish]
+        )
+        await session.stop()
+    }
+
+    func testTranscriptionOutsideTheActivePairIsIgnored() async {
+        // Given: 日英ペアで録音中のセッション
+        let speechService = FakeSpeechRecognitionService()
+        let translationService = FakeTranslationService()
+        let delegate = InterpretationSessionDelegateSpy()
+        let session = InterpretationSession(
+            translationService: translationService,
+            speechService: speechService
+        )
+        session.delegate = delegate
+        await session.start()
+
+        // When: ペアに含まれないスペイン語レーンの結果が届く
+        speechService.emit(text: "Buenas tardes", language: .spanish, isFinal: true)
+
+        // Then: 翻訳先が定まらない結果は表示も翻訳もしない
+        XCTAssertTrue(translationService.finalRequests.isEmpty)
+        XCTAssertTrue(delegate.lastSnapshot?.current.isEmpty ?? true)
+        await session.stop()
+    }
+
     func testSpeechFailureNotifiesOnlyAfterStopCompletes() async {
         // Given: 音声停止を明示再開まで保留する録音セッション
         let speechService = FakeSpeechRecognitionService()
@@ -686,14 +759,16 @@ private final class FakeSpeechRecognitionService: LocalSpeechRecognitionServicin
     var finalResultOnStop: (text: String, language: SpokenLanguage)?
     private(set) var startCallCount = 0
     private(set) var stopCallCount = 0
+    private(set) var startedLanguagePairs: [LanguagePair] = []
 
     private var startContinuation: CheckedContinuation<Void, Error>?
     private var stopContinuation: CheckedContinuation<Void, Never>?
     private var startWaiters: [CheckedContinuation<Void, Never>] = []
     private var stopWaiters: [CheckedContinuation<Void, Never>] = []
 
-    func start() async throws {
+    func start(languagePair: LanguagePair) async throws {
         startCallCount += 1
+        startedLanguagePairs.append(languagePair)
         let waiters = startWaiters
         startWaiters.removeAll()
         for waiter in waiters {

@@ -13,10 +13,10 @@ final class LocalTranslationServiceTests: XCTestCase {
         liveDriver.translations["live"] = "live translation"
         finalDriver.translations["final"] = "final translation"
         let liveRunTask = Task { @MainActor in
-            await service.runJapaneseToEnglishLive(driver: liveDriver)
+            await service.run(source: .japanese, priority: .live, driver: liveDriver)
         }
         let finalRunTask = Task { @MainActor in
-            await service.runJapaneseToEnglishFinal(driver: finalDriver)
+            await service.run(source: .japanese, priority: .final, driver: finalDriver)
         }
         defer {
             liveRunTask.cancel()
@@ -59,10 +59,10 @@ final class LocalTranslationServiceTests: XCTestCase {
         liveDriver.translationGates["live"] = liveGate
         finalDriver.translations["final"] = "final translation"
         let liveRunTask = Task { @MainActor in
-            await service.runJapaneseToEnglishLive(driver: liveDriver)
+            await service.run(source: .japanese, priority: .live, driver: liveDriver)
         }
         let finalRunTask = Task { @MainActor in
-            await service.runJapaneseToEnglishFinal(driver: finalDriver)
+            await service.run(source: .japanese, priority: .final, driver: finalDriver)
         }
         defer {
             liveRunTask.cancel()
@@ -111,11 +111,11 @@ final class LocalTranslationServiceTests: XCTestCase {
         )
         driver.translations["second"] = "translated second"
         let runTask = Task { @MainActor in
-            await service.runJapaneseToEnglishFinal(driver: driver)
+            await service.run(source: .japanese, priority: .final, driver: driver)
         }
         defer { runTask.cancel() }
         await driver.waitUntilPrepareCallCount(1)
-        XCTAssertFalse(service.isJapaneseToEnglishReady)
+        XCTAssertFalse(service.isFinalReady(source: .japanese))
 
         // When: 失敗後に2件の翻訳要求を順番に送る
         do {
@@ -139,7 +139,7 @@ final class LocalTranslationServiceTests: XCTestCase {
         XCTAssertEqual(translated, "translated second")
         XCTAssertEqual(driver.prepareCallCount, 3)
         XCTAssertEqual(driver.translationCalls, ["second"])
-        XCTAssertTrue(service.isJapaneseToEnglishReady)
+        XCTAssertTrue(service.isFinalReady(source: .japanese))
         runTask.cancel()
         await runTask.value
     }
@@ -149,16 +149,112 @@ final class LocalTranslationServiceTests: XCTestCase {
         let service = LocalTranslationService()
         let liveDriver = ControlledTranslationSession()
         let liveRunTask = Task { @MainActor in
-            await service.runJapaneseToEnglishLive(driver: liveDriver)
+            await service.run(source: .japanese, priority: .live, driver: liveDriver)
         }
         defer { liveRunTask.cancel() }
         await liveDriver.waitUntilPrepareCallCount(1)
 
         // When: liveレーンの準備完了を待つ
         // Then: readyフラグはfinalセッションの状態だけを表す
-        XCTAssertFalse(service.isJapaneseToEnglishReady)
+        XCTAssertFalse(service.isFinalReady(source: .japanese))
         liveRunTask.cancel()
         await liveRunTask.value
+    }
+
+    func testDifferentSourceLanguagesUseIndependentLanes() async throws {
+        // Given: 英西ペアの2方向それぞれに別driverを持つ翻訳サービス
+        let service = LocalTranslationService()
+        let englishDriver = ControlledTranslationSession()
+        let spanishDriver = ControlledTranslationSession()
+        englishDriver.translations["Good morning."] = "Buenos días."
+        spanishDriver.translations["Buenas tardes."] = "Good afternoon."
+        let englishRunTask = Task { @MainActor in
+            await service.run(
+                source: .english,
+                priority: .final,
+                driver: englishDriver
+            )
+        }
+        let spanishRunTask = Task { @MainActor in
+            await service.run(
+                source: .spanish,
+                priority: .final,
+                driver: spanishDriver
+            )
+        }
+        defer {
+            englishRunTask.cancel()
+            spanishRunTask.cancel()
+        }
+        await englishDriver.waitUntilPrepareCallCount(1)
+        await spanishDriver.waitUntilPrepareCallCount(1)
+
+        // When: 原文言語を変えて確定翻訳を依頼する
+        let fromEnglish = try await service.translate(
+            "Good morning.",
+            from: .english,
+            priority: .final
+        )
+        let fromSpanish = try await service.translate(
+            "Buenas tardes.",
+            from: .spanish,
+            priority: .final
+        )
+
+        // Then: 原文言語ごとのレーン(driver)だけへ届く
+        XCTAssertEqual(fromEnglish, "Buenos días.")
+        XCTAssertEqual(fromSpanish, "Good afternoon.")
+        XCTAssertEqual(englishDriver.translationCalls, ["Good morning."])
+        XCTAssertEqual(spanishDriver.translationCalls, ["Buenas tardes."])
+        XCTAssertTrue(service.isFinalReady(source: .english))
+        XCTAssertTrue(service.isFinalReady(source: .spanish))
+        englishRunTask.cancel()
+        spanishRunTask.cancel()
+        await englishRunTask.value
+        await spanishRunTask.value
+    }
+
+    func testNewSessionForSameDirectionTakesOverFromOldWorker() async throws {
+        // Given: 同じ方向で動いている翻訳ワーカー
+        let service = LocalTranslationService()
+        let firstDriver = ControlledTranslationSession()
+        let secondDriver = ControlledTranslationSession()
+        secondDriver.translations["文A。"] = "Sentence A"
+        let firstRunTask = Task { @MainActor in
+            await service.run(
+                source: .japanese,
+                priority: .final,
+                driver: firstDriver
+            )
+        }
+        defer { firstRunTask.cancel() }
+        await firstDriver.waitUntilPrepareCallCount(1)
+
+        // When: 言語ペア変更を模して同じ方向のセッションを張り直し、
+        // 古いワーカーが後から終了する
+        let secondRunTask = Task { @MainActor in
+            await service.run(
+                source: .japanese,
+                priority: .final,
+                driver: secondDriver
+            )
+        }
+        defer { secondRunTask.cancel() }
+        await secondDriver.waitUntilPrepareCallCount(1)
+        await firstRunTask.value
+        let translated = try await service.translate(
+            "文A。",
+            from: .japanese,
+            priority: .final
+        )
+
+        // Then: 古いワーカーの後始末が新しいワーカーを止めない
+        XCTAssertEqual(translated, "Sentence A")
+        XCTAssertEqual(secondDriver.translationCalls, ["文A。"])
+        XCTAssertTrue(firstDriver.translationCalls.isEmpty)
+        XCTAssertTrue(service.isFinalReady(source: .japanese))
+        secondRunTask.cancel()
+        await secondRunTask.value
     }
 
     func testFinalQueueOverflowReturnsExplicitError() async {
