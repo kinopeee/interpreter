@@ -675,6 +675,121 @@ final class InterpretationSessionTests: XCTestCase {
             "Sentence before failure"
         )
     }
+
+    func testStartFailureEntersErrorWithoutListening() async {
+        // Given: 音声認識の開始が権限エラーで失敗するセッション
+        let speechService = FakeSpeechRecognitionService()
+        speechService.startError = LocalSpeechRecognitionError.microphoneDenied
+        let translationService = FakeTranslationService()
+        let delegate = InterpretationSessionDelegateSpy()
+        let session = InterpretationSession(
+            translationService: translationService,
+            speechService: speechService
+        )
+        session.delegate = delegate
+
+        // When: 録音開始を試みる
+        await session.start()
+
+        // Then: listeningへ進まず、権限エラーを1回通知する
+        XCTAssertEqual(session.state, .error)
+        XCTAssertFalse(delegate.states.contains(.listening))
+        XCTAssertEqual(speechService.stopCallCount, 0)
+        XCTAssertEqual(delegate.messages, ["マイクを利用できません"])
+        XCTAssertEqual(
+            delegate.lastSnapshot?.statusBanner,
+            "マイクを利用できません"
+        )
+    }
+
+    func testStartIsIgnoredWhileAlreadyListening() async {
+        // Given: すでに録音中のセッション
+        let speechService = FakeSpeechRecognitionService()
+        let translationService = FakeTranslationService()
+        let session = InterpretationSession(
+            translationService: translationService,
+            speechService: speechService
+        )
+        await session.start()
+        XCTAssertEqual(session.state, .listening)
+
+        // When: 録音中にもう一度開始する
+        await session.start()
+
+        // Then: 二重起動せず、音声サービスのstartは1回だけ
+        XCTAssertEqual(session.state, .listening)
+        XCTAssertEqual(speechService.startCallCount, 1)
+        await session.stop()
+    }
+
+    func testStartAfterErrorReconnectsToListening() async {
+        // Given: 初回開始が失敗してerror状態のセッション
+        let speechService = FakeSpeechRecognitionService()
+        speechService.startError = LocalSpeechRecognitionError.speechRecognitionDenied
+        let translationService = FakeTranslationService()
+        let session = InterpretationSession(
+            translationService: translationService,
+            speechService: speechService
+        )
+        await session.start()
+        XCTAssertEqual(session.state, .error)
+
+        // When: 権限が回復した前提で再開始する
+        speechService.startError = nil
+        await session.start()
+
+        // Then: errorからlisteningへ復帰できる
+        XCTAssertEqual(session.state, .listening)
+        XCTAssertEqual(speechService.startCallCount, 2)
+        await session.stop()
+    }
+
+    func testWhitespaceRecognitionRetractsCurrentWithoutTranslation() async {
+        // Given: 日本語の暫定字幕を表示しているセッション
+        let speechService = FakeSpeechRecognitionService()
+        let translationService = FakeTranslationService()
+        let delegate = InterpretationSessionDelegateSpy()
+        let session = InterpretationSession(
+            translationService: translationService,
+            speechService: speechService
+        )
+        session.delegate = delegate
+        await session.start()
+        speechService.emit(text: "暫定字幕", language: .japanese, isFinal: false)
+        await delegate.waitUntilCurrentSource("暫定字幕")
+
+        // When: 空白だけのvolatile結果が届く
+        speechService.emit(text: "   ", language: .japanese, isFinal: false)
+
+        // Then: 空文字と同じくcurrentを撤回し、翻訳要求を出さない
+        XCTAssertTrue(delegate.lastSnapshot?.current.isEmpty == true)
+        XCTAssertTrue(translationService.liveRequests.isEmpty)
+        XCTAssertTrue(translationService.finalRequests.isEmpty)
+        await session.stop()
+    }
+
+    func testSpeechStatusBannerIsPublished() async {
+        // Given: 録音中のセッション
+        let speechService = FakeSpeechRecognitionService()
+        let translationService = FakeTranslationService()
+        let delegate = InterpretationSessionDelegateSpy()
+        let session = InterpretationSession(
+            translationService: translationService,
+            speechService: speechService
+        )
+        session.delegate = delegate
+        await session.start()
+
+        // When: 音声認識サービスが準備状況を通知する
+        speechService.emitStatus("モデルをダウンロードしています")
+
+        // Then: 字幕スナップショットのバナーへそのまま載せる
+        XCTAssertEqual(
+            delegate.lastSnapshot?.statusBanner,
+            "モデルをダウンロードしています"
+        )
+        await session.stop()
+    }
 }
 
 @MainActor
@@ -683,6 +798,7 @@ private final class FakeSpeechRecognitionService: LocalSpeechRecognitionServicin
 
     var suspendsStart = false
     var suspendsStop = false
+    var startError: Error?
     var finalResultOnStop: (text: String, language: SpokenLanguage)?
     private(set) var startCallCount = 0
     private(set) var stopCallCount = 0
@@ -698,6 +814,9 @@ private final class FakeSpeechRecognitionService: LocalSpeechRecognitionServicin
         startWaiters.removeAll()
         for waiter in waiters {
             waiter.resume()
+        }
+        if let startError {
+            throw startError
         }
         guard suspendsStart else { return }
 
@@ -742,6 +861,10 @@ private final class FakeSpeechRecognitionService: LocalSpeechRecognitionServicin
 
     func emitFailure(_ error: Error) {
         delegate?.localSpeechRecognitionService(didFail: error)
+    }
+
+    func emitStatus(_ message: String) {
+        delegate?.localSpeechRecognitionService(didUpdateStatus: message)
     }
 
     func waitUntilStartCalled() async {

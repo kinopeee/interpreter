@@ -177,6 +177,57 @@ final class SubtitleWindowGeometryTests: XCTestCase {
         assertControlSpacing(in: tallLayout)
     }
 
+    func testReturnsNilWhenNoScreensAreConnected() {
+        // Given: 画面フレームが空
+        // When: 保存位置と提案フレームの両方で画面を選ぶ
+        let containing = SubtitleWindowGeometry.screenIndex(
+            containing: CGPoint(x: 10, y: 10),
+            in: [],
+            fallbackIndex: 0
+        )
+        let matching = SubtitleWindowGeometry.screenIndex(
+            bestMatching: CGRect(x: 0, y: 0, width: 100, height: 100),
+            in: [],
+            fallbackIndex: 0
+        )
+
+        // Then: 不正なfallbackへ倒れず未選択を返す
+        XCTAssertNil(containing)
+        XCTAssertNil(matching)
+    }
+
+    func testNonFiniteOriginUsesFallbackScreen() {
+        // Given: NaNを含む保存位置と、有効な2画面
+        let screenFrames = [
+            CGRect(x: 0, y: 0, width: 800, height: 600),
+            CGRect(x: 800, y: 0, width: 1_000, height: 700)
+        ]
+
+        // When: 非有限座標で画面を選ぶ
+        let index = SubtitleWindowGeometry.screenIndex(
+            containing: CGPoint(x: CGFloat.nan, y: 10),
+            in: screenFrames,
+            fallbackIndex: 1
+        )
+
+        // Then: 座標比較をせずfallback画面を使う
+        XCTAssertEqual(index, 1)
+    }
+
+    func testSubtitleWidthCapsAtMaximumAndRejectsEmptyFrame() {
+        // Given: 超広画面と幅0の作業領域
+        let ultraWide = CGRect(x: 0, y: 0, width: 4_000, height: 1_200)
+        let empty = CGRect(x: 0, y: 0, width: 0, height: 800)
+
+        // When: 字幕幅を算出する
+        let capped = SubtitleWindowGeometry.subtitleWidth(in: ultraWide)
+        let zero = SubtitleWindowGeometry.subtitleWidth(in: empty)
+
+        // Then: 70%でも1200ptを超えず、負や0幅は0へ倒す
+        XCTAssertEqual(capped, 1_200)
+        XCTAssertEqual(zero, 0)
+    }
+
     private var testVisibleFrame: CGRect {
         CGRect(x: -300, y: -200, width: 1_000, height: 800)
     }

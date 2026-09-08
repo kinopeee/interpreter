@@ -112,4 +112,36 @@ final class LatestTranslationSchedulerTests: XCTestCase {
         XCTAssertEqual(scheduler.pendingFinalCount, 1)
         XCTAssertEqual(scheduler.next(), "replacement")
     }
+
+    func testRemoveAllReturnsFinalsThenLive() {
+        // Given: 確定文2件と最新仮訳が残っているスケジューラ
+        var scheduler = LatestTranslationScheduler<String>(finalCapacity: 4)
+        _ = scheduler.enqueue("final-1", priority: .final)
+        _ = scheduler.enqueue("final-2", priority: .final)
+        _ = scheduler.enqueue("live", priority: .live)
+
+        // When: 全件を取り出す
+        let removed = scheduler.removeAll()
+
+        // Then: FIFOの確定文のあとに仮訳を返し、キューを空にする
+        XCTAssertEqual(removed, ["final-1", "final-2", "live"])
+        XCTAssertTrue(scheduler.isEmpty)
+        XCTAssertNil(scheduler.next())
+    }
+
+    func testRemoveAllWhereDropsOnlyMatchingLiveItem() {
+        // Given: 確定文と仮訳が共存するスケジューラ
+        var scheduler = LatestTranslationScheduler<String>(finalCapacity: 2)
+        _ = scheduler.enqueue("keep-final", priority: .final)
+        _ = scheduler.enqueue("drop-live", priority: .live)
+
+        // When: 仮訳だけを除去する
+        let removed = scheduler.removeAll { $0 == "drop-live" }
+
+        // Then: 確定文は残し、容量も仮訳も解放する
+        XCTAssertEqual(removed, ["drop-live"])
+        XCTAssertEqual(scheduler.pendingFinalCount, 1)
+        XCTAssertEqual(scheduler.next(), "keep-final")
+        XCTAssertTrue(scheduler.isEmpty)
+    }
 }
