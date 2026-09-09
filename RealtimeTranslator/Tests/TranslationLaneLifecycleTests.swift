@@ -20,7 +20,7 @@ final class TranslationLaneLifecycleTests: XCTestCase {
         }
 
         // Then: 既存キューを見逃さず、consumerを起こして取り出せる
-        await fulfillment(of: [wake], timeout: 1)
+        await fulfillment(of: [wake], timeout: 1.0)
         XCTAssertTrue(lane.takeNext() === request)
         request.cancel()
     }
